@@ -1,0 +1,499 @@
+---
+title: "predict_acres_with_bayer_sales"
+author: "Oliver Causey"
+date: "8/25/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+#devtools::load_all("BPI/")
+library(data.table)
+library(corrplot)
+library(ggplot2)
+library(EnvStats)
+library(MASS) #for boxcox
+#plot predictors vs residuals. worry if there is a pattern
+library(kableExtra)
+library(MLmetrics)
+set.seed(123)
+```
+
+
+```{r functions}
+#' Remove commas in numeric column
+#' @title rm_comma
+#' @param x a character or a character vector
+#' @example rm_comma("92,006")
+rm_comma <- function(x){
+  x <- as.numeric(gsub(",","", x))
+  return(x)
+}
+################
+################
+################
+#function to generate linear model results
+#using the growing window technique.
+get_linear_results <- function(window_size) {
+  linear_results <- c()
+for ( i in 1:(nrow(model_data)-1)) {
+  dataset_temp <- as.data.frame(model_data[1:(i + window_size -1),])
+  data <- as.data.frame(copy(dataset_temp))
+  linear_temp <- lm(acres_corn_US ~ ., data = data)
+linear_results[i] <- predict(linear_temp,
+                           model_data[i+window_size,1:2])
+}
+#get predictions, response
+predictions <- unlist(linear_results)[1:(nrow(model_data)-window_size)]
+response<- model_data$acres_corn_US[(window_size+1):nrow(model_data)]
+#calculate basic metrics and put into tabular form
+mae  <- MAE(predictions, response)/1000000
+mape <- MAPE(predictions, response)*100
+rmse <- RMSE(predictions, response)/1000000
+stats_table <- rbind(mae,mape,rmse)
+row.names(stats_table) <- c("MAE (Million Acres)",
+                            "MAPE (%) ",
+                            "RMSE (Million Acres)")
+stats_table
+}
+################
+################
+################
+#function to generate linear model results
+#using the moving window technique.
+moving_window <- function(window_size) {
+  linear_results <- c()
+for ( i in 1:(nrow(model_data)-1)) {
+  dataset_temp <- as.data.frame(model_data[1:(i + window_size -1),])
+  data <- as.data.frame(copy(dataset_temp))
+  linear_temp <- lm(acres_corn_US ~ ., data = data)
+#extract model parameters
+#intercept <- coef(summary(linear_temp))["(Intercept)",1]
+#slope <- coef(summary(linear_temp))["total_order",1]
+#predict next year's acres (i+window_size)
+#linear_results[i] <- intercept + slope*model_data[i+window_size,1]
+linear_results[i] <- predict(linear_temp,
+                            model_data[i+window_size,1:2])
+}
+#get predictions and response
+predictions <- unlist(linear_results)[1:(nrow(model_data)-window_size)]
+response<- model_data$acres_corn_US[(window_size+1):nrow(model_data)]
+#calculate basic metrics and put into tabular form
+mae  <- MAE(predictions,  response)/1000000
+mape <- MAPE(predictions, response)*100
+rmse <- RMSE(predictions, response)/1000000
+stats_table <- rbind(mae,mape,rmse)
+row.names(stats_table) <- c("MAE (Million Acres)",
+                            "MAPE (%) ",
+                            "RMSE (Million Acres)")
+stats_table
+}
+#################
+#################
+#################
+#function to add noise for noise testing
+moving_window_jitter <- function(window_size, noise) {
+  linear_results <- c()
+for ( i in 1:(nrow(model_data)-1)) {
+  dataset_temp <- as.data.frame(model_data[1:(i + window_size -1),])
+  data <- as.data.frame(copy(dataset_temp))
+  linear_temp <- lm(jitter(acres_corn_US, noise) ~ ., data = data)
+#extract model parameters
+#intercept <- coef(summary(linear_temp))["(Intercept)",1]
+#slope <- coef(summary(linear_temp))["total_order",1]
+#predict next year's acres (i+window)
+#linear_results[i] <- intercept + slope*model_data[i+window_size,1]
+linear_results[i] <- predict(linear_temp,
+                           model_data[i+window_size,1:2])
+}
+#get predications and response
+predictions <- unlist(linear_results)[1:(nrow(model_data)-window_size)]
+response<- model_data$acres_corn_US[(window_size+1):nrow(model_data)]
+#calculate basic metrics
+mae  <- MAE(predictions,  response)/1000000
+mape <- MAPE(predictions, response)*100
+rmse <- RMSE(predictions, response)/1000000
+#put basic metrics into tabular format
+stats_table <- rbind(mae,mape,rmse)
+row.names(stats_table) <- c("MAE (Million Acres)",
+                            "MAPE (%) ",
+                            "RMSE (Million Acres)")
+stats_table
+}
+```
+
+
+```{r get_munge_data, echo=FALSE}
+munge_data <- function(){
+feature_data <- readxl::read_xlsx("../data/raw/sales_2006-2020.xlsx")
+names(feature_data) <- feature_data[2,]
+response_data <- as.data.table(read.csv("../data/raw/acreplanted_national_corn_nass_1926-2020.csv"))
+#response data needs an easy to read name
+response_data$acres_corn_US <- response_data$CORN...ACRES.PLANTED......b.VALUE..b.
+#remove commas from acre data
+response_data[, acres_corn_US:=rm_comma(acres_corn_US)]
+#feature names are in second row of data
+names(feature_data) <- feature_data[2,]
+#remove non-data (empty rows and column name are the first two rows of data)
+feature_data <- feature_data[3:nrow(feature_data),]
+feature_dt <- as.data.table(feature_data)
+response_dt <- as.data.table(response_data)
+# remove "M" from year and month in sales data.
+feature_dt$year <- gsub( "M", "", as.character(feature_dt$`Market Year`) )
+feature_dt$month <- gsub( "M", "", as.character(feature_dt$`MY Month Nbr`))
+#assign the same data type to merging column
+response_dt$year <- as.integer(response_dt$Year)
+feature_dt$year <- as.integer(feature_dt$year)
+#merge data
+data_by_month <- merge(feature_dt,response_dt,by ="year")
+#grab useful columns
+columns_to_keep <- c("year",
+                     "month",
+                     "Order Quantity",
+                     "acres_corn_US")
+dataset <- data_by_month[, ..columns_to_keep]
+data_numeric <- data_by_month[,lapply(dataset, as.numeric)]
+#grab only data from November and earlier
+before_november <- data_numeric[data_numeric$month < 2,]
+national_sales_before_november <- before_november["Brand" == "National",]
+#merge the regional and national brand data
+summed_national_sales <-before_november[, "total_order" :=sum(`Order Quantity`),
+                                               by=.(year,acres_corn_US) ]
+cols_to_keep <- c("total_order",  "acres_corn_US", "year")
+orders_acres <- unique(summed_national_sales[,..cols_to_keep])
+#merge usda projections with features
+#get USDA projection data
+USDA <- read.csv("../data/raw/USDACornPlantingProjections.csv")
+USDA$year <- as.numeric(substr(USDA$Year2, start = 6, stop = 10)) #Keeping the planting year of the 2 year range
+#order by year so that we can use the each row containing the
+# first instance of the year variable
+USDA_ordered <- setorder(USDA, YearProjected2, year)
+#get only the first year predicitons
+ordered_projections <- USDA_ordered[match(unique(USDA_ordered$YearProjected2), USDA_ordered$YearProjected2),]
+ordered_projections$projection <- as.numeric(ordered_projections$Value*1000000)
+ordered_projections$year <- as.numeric(ordered_projections$year)
+data_for_model <- merge(orders_acres, ordered_projections, by = "year")
+columns_to_keep <- c("total_order",
+                     "projection",
+                     "acres_corn_US")
+model_data <- data_for_model[ ,..columns_to_keep]
+model_data <- na.omit(model_data)
+model_data$projection
+return(model_data)
+}
+model_data <- munge_data()
+```
+
+
+```{r linear_results}
+results <- data.table()
+results$window_4 <-get_linear_results(5)
+results$window_5 <-get_linear_results(6)
+results$window_6 <-get_linear_results(7)
+results$window_7 <-get_linear_results(8)
+results$window_8 <-get_linear_results(9)
+results$window_9 <-get_linear_results(10)
+results <- data.frame(results)
+```
+
+
+```{r regression}
+```
+
+```{r moving_window_results}
+results <- data.table()
+results$window_4 <-moving_window(5)
+results$window_5 <-moving_window(6)
+results$window_6 <-moving_window(7)
+results$window_7 <-moving_window(8)
+results$window_8 <-moving_window(9)
+results$window_9 <-moving_window(10)
+results <- data.frame(results)
+```
+
+
+```{r noise_test_results}
+#jitter noise = 5
+results5 <- data.table()
+results5$window_4 <-moving_window_jitter(window_size = 5, noise =  5)
+results5$window_5 <-moving_window_jitter(6, noise =  5)
+results5$window_6 <-moving_window_jitter(7, noise =  5)
+results5$window_7 <-moving_window_jitter(8, noise =  5)
+results5$window_8 <-moving_window_jitter(9, noise =  5)
+results5$window_9 <-moving_window_jitter(10, noise =  5)
+results5 <- data.frame(results5)
+#jitter noise = 10,000
+results10000 <- data.table()
+results10000$window_4 <-moving_window_jitter(5, noise =  10000)
+results10000$window_5 <-moving_window_jitter(6, noise =  10000)
+results10000$window_6 <-moving_window_jitter(7, noise =  10000)
+results10000$window_7 <-moving_window_jitter(8, noise =  10000)
+results10000$window_8 <-moving_window_jitter(9, noise =  10000)
+results10000$window_9 <-moving_window_jitter(10, noise =  10000)
+results10000 <- data.frame(results10000)
+```
+
+
+```{r show_results}
+row.names(results) <- c("MAE (Million Acres)",
+                              "MAPE (%)",
+                              "RMSE")
+#show results with no noise
+results
+```
+
+
+```{r results_jitter=5}
+row.names(results5) <- c("MAE (Million Acres)",
+                              "MAPE (%)",
+                              "RMSE")
+#show results with jitter =5
+results5
+```
+
+
+```{r results_jitter=10000}
+row.names(results10000) <- c("MAE (Million Acres)",
+                              "MAPE (%)",
+                              "RMSE")
+#show results with jitter = 10,000
+results10000
+```
+#for a sanity check, see how well acres fit to years.
+
+```{r fit_acres_to_years}
+x <- 2006:2019
+fit <- lm(model_data$acres_corn_US ~ x)
+plot(2006:2019,model_data$acres_corn_US, ylim = c(0,10^8))
+abline(fit)
+```
+
+
+```{r summary_of_fit_to_years}
+summary(fit)
+```
+```{r linear_model_stats}
+model_data <- munge_data()
+linear_model <- lm(acres_corn_US ~ ., data = model_data)
+summary(linear_model)
+```
+
+
+```{r linear_model_plots}
+plot(linear_model)
+```
+
+
+```{r more_linear_model_plots}
+plot(model_data$total_order*coef(summary(linear_model))[2,1]+
+       model_data$projection*coef(summary(linear_model))[3,1],
+     model_data$acres_corn_US,
+     ylim = c(0,10^8),
+     ylab = "planted acres",
+     xlab = "features")
+```
+#Assumptions of a linear model
+##Assumption model is linear wrt orders: yes
+
+```{r summary}
+summary(linear_model)
+```
+##Assumption: mean of the residuals is zero
+```{r mean_residuals}
+mean(residuals(linear_model))
+```
+###note that the mean is approximately zero
+
+##Assumption: Homoscedasticity of residuals or equal variance
+```{r homoscedastic_residuals}
+par(mfrow=c(2,2))  # set 2 rows and 2 column plot layout
+plot(linear_model)
+```
+
+###note the nonflat curve for the sqrt(residuals) ( the variance is not the same throughout => heteroscedastic)
+
+##No autocorrelation of the data
+```{r autocorrelation_test}
+acf(linear_model$residuals)
+```
+#now we will normalize the data (divide acres by 10^8 and divide sales by 1.3*10^7) and repeat the above steps
+#for a sanity check, see how well acres fit to years. We also take the log of the output to handle heteroscedasticity.
+
+```{r transform_data}
+model_data$acres_corn_US <- log(model_data$acres_corn_US)
+model_data$acres_corn_US <- model_data$acres_corn_US/max(range(model_data$acres_corn_US))
+model_data$total_order <- model_data$total_order/(1.3*10^7)
+```
+```{r xform_fit_}
+fit <- lm(acres_corn_US ~ ., data = model_data)
+plot(model_data$total_order,model_data$acres_corn_US,
+     ylim = c(0.98,1))
+plot(fit)
+```
+
+
+```{r summary_of_xform_fit}
+summary(fit)
+```
+```{r xform_inputs}
+model_data$total_order <- sqrt(model_data$total_order)
+```
+
+
+```{r xform_linear_model_plots}
+linear_model <- lm(acres_corn_US ~ total_order, data = model_data)
+plot(linear_model)
+```
+
+
+```{r more_xform_linear_model_plots}
+plot(model_data$total_order,
+     model_data$acres_corn_US,
+     ylab = "planted acres",
+     xlab = "bags ordered",
+     ylim = c(0,1))
+abline(linear_model)
+```
+#Assumptions of a linear model
+##Assumption model is linear wrt orders: yes
+
+```{r xform_summary}
+summary(linear_model)
+```
+##Assumption: mean of the residuals is zero
+```{r xform_mean_residuals}
+mean(residuals(linear_model))
+```
+###note that the mean is approximately zero
+
+##Assumption: Homoscedasticity of residuals or equal variance
+```{r xform_homoscedastic_residuals}
+par(mfrow=c(2,2))  # set 2 rows and 2 column plot layout
+plot(linear_model)
+```
+
+###note the flat curve for the sqrt(residuals) vs Fitted Values ( the variance is the same throughout => homoscedastic)
+
+
+#boxcox transform the response
+```{r box_cox}
+model_data <- munge_data()
+#add usda projections as a feature
+box_cox <-boxcox(model_data$acres_corn_US ~ ., lambda = seq(-20, 20))
+```
+```{r box_cox_parameters, echo=FALSE}
+lambda <- box_cox$x # lambda values
+likelihood <- box_cox$y # log likelihood values for SSE
+lambda_likelihood <- cbind(lambda, likelihood) # combine lambda and lik
+sorted_lam_lik <- lambda_likelihood[order(-likelihood),] # values are sorted to identify the lambda value for the maximum log likelihood for obtaining minimum SSE
+head(sorted_lam_lik)
+```
+# We see that the lambda value of ~ -10.3
+# generates the maximum likelihood.
+# we us this to fit the data
+```{r box_cox_fit}
+lambda <- 4.24
+box_cox_fit <- lm((model_data$acres_corn_US^(lambda)-1)/(lambda) ~ ., data = model_data)
+summary(box_cox_fit)
+```
+
+
+
+
+```{r box_cox_model_plots}
+plot(box_cox_fit)
+```
+
+
+
+
+
+##No autocorrelation of the data
+```{r autocorrelation_test}
+my_acf <-acf(box_cox_fit$residuals)
+my_acf
+```
+
+```{r get_permutation_results}
+model_data <- model_data[sample(nrow(model_data))]
+resultsP1 <- data.table()
+resultsP1$window_4 <-moving_window(5)
+resultsP1$window_5 <-moving_window(6)
+resultsP1$window_6 <-moving_window(7)
+resultsP1$window_7 <-moving_window(8)
+resultsP1$window_8 <-moving_window(9)
+resultsP1$window_9 <-moving_window(10)
+resultsP1 <- data.frame(resultsP1)
+#make another permutation
+model_data <- model_data[sample(nrow(model_data))]
+resultsP2 <- data.table()
+resultsP2$window_4 <-moving_window(5)
+resultsP2$window_5 <-moving_window(6)
+resultsP2$window_6 <-moving_window(7)
+resultsP2$window_7 <-moving_window(8)
+resultsP2$window_8 <-moving_window(9)
+resultsP2$window_9 <-moving_window(10)
+resultsP2 <- data.frame(resultsP2)
+#make another permutation
+model_data <- model_data[sample(nrow(model_data))]
+resultsP3 <- data.table()
+resultsP3$window_4 <-moving_window(5)
+resultsP3$window_5 <-moving_window(6)
+resultsP3$window_6 <-moving_window(7)
+resultsP3$window_7 <-moving_window(8)
+resultsP3$window_8 <-moving_window(9)
+resultsP3$window_9 <-moving_window(10)
+resultsP3 <- data.frame(resultsP3)
+```
+
+
+```{r results_no_noise}
+row.names(results) <- c("MAE (Million Acres)",
+                              "MAPE (%)",
+                              "RMSE")
+results
+```
+
+
+```{r show_results_permutation1}
+row.names(resultsP1) <- c("MAE (Million Acres)",
+                              "MAPE (%)",
+                              "RMSE")
+resultsP1
+```
+
+
+```{r show_results_permutation2}
+row.names(resultsP2) <- c("MAE (Million Acres)",
+                              "MAPE (%)",
+                              "RMSE")
+resultsP2
+```
+
+
+```{r show_results_permutation3}
+row.names(resultsP3) <- c("MAE (Million Acres)",
+                              "MAPE (%)",
+                              "RMSE")
+resultsP3
+```
+
+
+
+
+
+```{r all_9_year_window_results}
+#let's look at all of the results for 9 year window
+all_results <- data.table()
+all_results$linear <- results$window_9
+all_results$noise5 <- results5$window_9
+all_results$noise10000 <- results10000$window_9
+all_results$permutation1 <- resultsP1$window_9
+all_results$permutation2 <- resultsP2$window_9
+all_results$permutation3 <- resultsP3$window_9
+results_frame <- as.data.frame(all_results)
+row.names(results_frame) <- c("MAE (Million Acres)",
+                              "MAPE (%)",
+                              "RMSE")
+results_frame
+```
