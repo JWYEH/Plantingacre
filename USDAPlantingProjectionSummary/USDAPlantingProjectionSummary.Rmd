@@ -1,0 +1,827 @@
+---
+title: "Bayer Planting Intentions"
+author: "Julie Wisch"
+date: "9/1/2020"
+output: pdf_document
+---
+
+# Executive Summary
+
+In this document we aim to answer the following two questions: How well can we predict how many acres of corn will be planted in the United States in a given year? How quickly can we generate this prediction?
+
+The USDA releases annual projections of national planting acreage that are usually within 3 - 4 million acres of the true value. Using the modeling approach outlined in the following pages, we can predict the national planting acreage within 1 - 3 million acres of actual planting. We can make an initial projection in December of the year prior to the start of the market year (e.g. December 2019 for a March 2021 planting) (mean average error of approximately 2.2 million acres), and then continue to refine this projection in the fall of the planting year (e.g. Sept - Nov 2020 for a March 2021 planting). In November, we can predict the spring planting within about one million acres. Addition of spring purchase information does not improve our model. The Bayer Crop Science (BCS) team's model is a substantial improvement over the USDA's projections. In order to construct this model, we need Bayer order data as well as the publicly available USDA projections.
+
+# USDA Projections and BCS
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE)
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(tidyr)
+library(parsnip)
+library(Metrics)
+library(gridExtra)
+library(kableExtra)
+source(".././RandomForest/USDAProjectionsFunctions.R")
+devtools::load_all(".././BPI/")
+PerturbData <- FALSE #Do we want to test things out by perturbing the response variable?
+jitterFactor <- 50000 #How much do we want to jitter response by? Only matters if PerturbData = TRUE
+ShuffleYears <- FALSE #Do we want to test things by randomly shuffling the response variable?
+window_list <- c(6, 7, 8, 9, 10) #List of the sliding window sizes we want to test out
+TypeofWindow <- "Sliding" #Either growing or sliding. If it's sliding, it relies on the vector above.
+selected_window <- 8
+get_ResultSummary <- function(DF, Actual, Predicted){
+  DF <- data.frame(DF)
+  Summary <- c("MAEinMillionAcres)" = round(mae(DF[, Actual], DF[, Predicted]) / 10^6, 2),
+               "MSE" = round(mse(DF[, Actual], DF[, Predicted]), 0),
+               "RMSE" = round(rmse(DF[, Actual], DF[, Predicted]), 2),
+               "MAPEinPercent" = round(mape(DF[, Actual], DF[, Predicted]) * 100, 2)
+  )
+  return(Summary)
+}
+get_XGBResults <- function(dataset, window, model_parameters, modelname){
+totalresult_xgb <- list()
+
+ for(i in 1:2){
+ xgb_fit <- xgb_mode %>%
+        fit(as.formula(paste("acre_corn_actual~",paste(model_parameters, collapse="+"))),
+            data = dataset[i:window - 1 + i,])
+      result_xgb <- predict(xgb_fit, dataset[window + i,])
+      totalresult_xgb[[i]] <- data.frame("ProjectedYear" = dataset[window + i, "ProjectedYear"],
+                                         "result" = result_xgb,
+                                        "actual" = dataset[window + i, "acre_corn_actual"],
+                                        "USDA" = dataset[window + i, "PlantingAcres"])}
+result <- rbindlist(totalresult_xgb)
+result$Model <- modelname
+return(result)}
+get_Residual <- function(dataset, model_parameters, window){
+  totalresult_xgb <- list()
+  RegressionFormula <- as.formula(paste("acre_corn_actual~",
+                                        paste(model_parameters, collapse="+")))
+  for (i in 1:(length(dataset[,"acre_corn_actual"]) - window)){
+    actual <- dataset[(window + i), "acre_corn_actual"]
+
+    xgb_fit <- xgb_mode %>%
+      fit(RegressionFormula, data = dataset[i:(window + i  - 1),])
+
+    result_xgb <- predict(xgb_fit, dataset[(window + i ),])
+    totalresult_xgb[[i]] <- data.frame("YearofAnalysis" = dataset[(window + i ), "YearofAnalysis"],
+                                       "result" = result_xgb, "actual" = actual)}
+
+  Results <- rbindlist(totalresult_xgb)
+  Results$residual <- abs(Results$.pred - Results$actual)
+  Results$window <- window
+  return(Results)}
+WrapUpResiduals <- function(dataset, model_parameters, window_list){
+  baseline <- list()
+  for(i in 1:length(window_list)){
+    baseline[[i]] <- get_Residual(dataset, model_parameters, window_list[i])
+  }
+  baseline <- rbindlist(baseline)
+  baseline$window <- as.factor(baseline$window)
+  return(baseline)}
+get_CI <- function(DF, BootstrapName){
+  DF <- data.frame(DF)
+  DF[, "Bootstrap"] <- BootstrapName
+  Ordered_DF <- DF[order(DF[, "x"]),]
+  index_low <- as.numeric(.05*length(Ordered_DF[, "x"]))
+  index_high <- as.numeric(.95*length(Ordered_DF[, "x"]))
+return(data.frame("Low" = round(Ordered_DF[index_low, "x"], 1), "High" = round(Ordered_DF[index_high, "x"], 1)))}
+get_DistPlot <- function(block_baseline, stationary_baseline){
+  block_baseline$bootstrap <- "Block"
+stationary_baseline$bootstrap <- "Stationary"
+bs <- rbind(block_baseline, stationary_baseline)
+colnames(bs)[1] <- "MAE"
+p <-  ggplot(bs, aes(x=MAE, fill=bootstrap)) +
+    geom_histogram( color="#e9ecef", alpha=0.6, position = 'identity') +
+    scale_fill_manual(values=c("#69b3a2", "#404080")) +
+    theme_bw() +
+    labs(fill="") + ylab("") + xlab("MAE (millions of acres)")
+
+    print(paste0("Block Baseline Confidence Interval: (", get_CI(block_baseline, "Block")[1,1], ", ",
+                 get_CI(block_baseline, "Block")[1,2],  ")"))
+    print(paste0("Stationary Baseline Confidence Interval: (", get_CI(stationary_baseline, "Stationary")[1,1], ", ",
+                 get_CI(stationary_baseline, "Stationary")[1,2], ")"))
+
+    return(p)
+}
+```
+
+## USDA Projection Availability
+
+The USDA publishes corn planting projections annually. It is the BCS team's understanding that these models are developed in October, preliminarily released in November, and re-released in final form in February. When the USDA projections are published, the USDA produces projections for an 8 to 11 year range, depending on the year of publication. Projections start with a backwards looking projection to data 1 year prior to the model publication up to 7 - 10 years after the projection publication. These projections are publicly available on the USDA's webpage: https://data.ers.usda.gov/reports.aspx?ID=17821 . The first publicly available year of model projections is 1997.
+
+To clarify the dates involved, here is an example: In October of 2019, the forecasting team at the USDA met and developed a corn acreage prediction. In November of 2019, the team released preliminary projections, with finalized projections coming in February of 2020 for the number of acres planted in March of 2020. They projected the number of acres planted in the US of corn in March 2019 (year -1), all the way up to the number of acres of corn planted in the US in March 2029 (year +9 ).
+
+
+![Timeline of USDA Projection Availability.](.././RandomForest/TimelineFigure.jpg)
+
+\newpage
+
+The USDA also conducts annual surveys in the first two weeks of March in order to project the total number of acres planted in the US for that spring. These surveys are re-conducted in June and August of the same year in order to update the planting totals. The USDA uses these probabilistic surveys to calculate the total number of acres planted annually. These totals can be found here: https://quickstats.nass.usda.gov/results/823A5054-B8F9-3341-AC31-8B03C6990BC1 . For our efforts at modeling the total planting acreage in the US, we will consider these values to be the "ground truth". The first available year of planted acres is 1926. We show all years in the figure below, but for the purposes of modeling, we will only use 2006 - present. For the case of the survey data, the year corresponds with the March where the corn was planted. If corn was planted in March of 2020, the year in this dataset is 2020.
+
+
+\newpage
+### Historical Acreage Plantings
+
+Historical results of the USDA's annual planting survey are shown below.
+
+```{r}
+acre <- fread(".././data/raw/acreplanted_national_corn_nass_1926-2020.csv")
+acre <- acre[,c("Year", "CORN - ACRES PLANTED  -  <b>VALUE</b>")]
+colnames(acre)[2] <- "acre_corn_actual"
+acre[, acre_corn_actual:=rm_comma(acre_corn_actual)]
+acre$adjusted_acre_corn_actual <- acre$acre_corn_actual / 10^6
+ggplot(acre, aes(x = Year, y = adjusted_acre_corn_actual)) + geom_line() + xlab("Year") +
+  ylab("Annual Corn Acreage Planting (Millions of Acres)") + theme_bw() +
+  scale_y_continuous(breaks = round(seq(min(acre$adjusted_acre_corn_actual),
+                                        max(acre$adjusted_acre_corn_actual), by = 5),0)) +
+  scale_x_continuous(breaks = round(seq(min(acre$Year),
+                                        max(acre$Year), by = 10),0))
+```
+
+### Model Projections vs Historical Reality
+
+Model projections are only available consistently starting in 1996. We were also able to obtain projections from 1993 and 1995. Projections from 1997 on are publicly available online; years 1993, 1995 and 1996 were provided via email exchange with the USDA.
+
+In the figures below, the heading shows the number of years between the projection and actual planting, the ground truth is on the x axis, and the USDA's projection is on the y axis. A diagonal line cuts across the plot. If a  projection is absolutely perfect, the point will lie on the diagonal line. If the projection overpredicts, the point will be above the diagonal. Conversely, if the projection underpredicts, the projection will be below the diagonal.
+
+For year -1, the projection is made with full knowledge of the year's events, and you can see that the model works extremely well. The year 0 projection refers to the year where the projection is released in February and the planting actually occurs in March of the same year. The projection also appears to be reasonably successful then. By the time the USDA is predicting 5 or more years into the future, there is a minimally discernable relationship between the ground truth and the projections.
+
+```{r}
+USDA <- read.csv(".././data/raw/USDACornPlantingProjections.csv")
+USDA$Year2 <- substr(USDA$Year2, start = 6, stop = 10)
+colnames(USDA) <- c("Commodity", "Attribute", "Units", "YearofAnalysis", "ProjectedYear", "PlantingAcres")
+df <- merge(USDA, acre, by.x = "ProjectedYear", by.y = "Year", all = FALSE)
+df$PlantingAcres <- df$PlantingAcres*10^6
+df <- df[, c("Commodity", "Attribute", "YearofAnalysis", "ProjectedYear", "PlantingAcres", "acre_corn_actual")]
+df$TimeBetweenAnalysisandProjection <- as.numeric(df$ProjectedYear) - as.numeric(df$YearofAnalysis)
+ggplot(df[df$TimeBetweenAnalysisandProjection > -2 & df$TimeBetweenAnalysisandProjection < 11,], aes(x = acre_corn_actual, y = PlantingAcres)) + geom_point() +
+   xlab("Historic Ground Truth") + ylab("USDA Projection") +
+   geom_abline(intercept = 0, slope = 1, linetype = "dashed") + theme_bw() +
+  facet_wrap( ~ TimeBetweenAnalysisandProjection) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r, message=FALSE, warning=FALSE, results=FALSE}
+####################################
+#Adding in our sales records########
+####################################
+Sales <- read_excel(".././data/raw/sales_2006-2020.xlsx")
+colnames(Sales) <- Sales[2,]
+Sales <- Sales[-c(1:2),]
+Sales <- data.frame(Sales)
+Sales <- Sales[, c("Dealer.Account.CY.Brand.Family", "Market.Year", "MY.Month.Nbr", "Order.Quantity")]
+colnames(Sales) <- c("Brand", "MarketYear", "Month", "Orders")
+Sales$MarketYear <- as.numeric(gsub("([0-9]+).*$", "\\1", Sales$MarketYear)) #Only keeping numeric in year and month
+Sales$Month <- as.numeric(gsub("([0-9]+).*$", "\\1", Sales$Month))
+#The way this is ordered is month 01 is SEPTEMBER, the beginning of the sales season
+#06 is February - the last month of the order season we'd be interested in.
+Sales$Orders <- as.numeric(Sales$Orders)
+Sales <- Sales[, c("Brand", "MarketYear", "Month", "Orders")]
+Sales <- data.table(Sales)[, OrdersRunningTotal := cumsum(Orders), by = list(Brand, MarketYear)]
+Sales$Month <- as.factor(Sales$Month)
+#Naming the months to minimize confusion
+levels(Sales$Month) <- list("Sept" = "1", "Oct" = "2", "Nov" = "3", "Dec" = "4", "Jan" = "5", "Feb" = "6",
+                  "Mar" = "7", "Apr" = "8", "May" = "9", "June" = "10", "July" = "11", "Aug" = "12")
+Order_National <- spread(Sales[Sales$Brand == "NATIONAL",c("Brand", "MarketYear", "Month", "Orders")], Month, Orders)
+RunningOrder_National <- spread(Sales[Sales$Brand == "NATIONAL",c("Brand", "MarketYear", "Month", "OrdersRunningTotal")], Month, OrdersRunningTotal)
+Order_National <- create_lag(Order_National, c("Sept", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "June", "July", "Aug"), N = 2)
+Order_National <- Order_National$data
+RunningOrder_National <- create_lag(RunningOrder_National, c("Sept", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "June", "July", "Aug"), N = 2)
+RunningOrder_National <- RunningOrder_National$data
+```
+
+```{r}
+# We can quantify the USDA's model performance using several error metrics. Below we show the mean absolute error (MAE), which describes how many million acres per year, on average, the model and reality differ, as well as the mean squared error (MSE), root mean squared error (RMSE), and mean absolute percent error (MAPE).
+TimeWindows <- c(seq(from = -1, to = 10, by = 1))
+Results <- list()
+for(i in 1:length(TimeWindows)){
+  Results[[i]] <-get_ResultSummary(df[df$TimeBetweenAnalysisandProjection == TimeWindows[i] &
+                                        df$YearofAnalysis >= min(Sales$MarketYear),],
+                                   "acre_corn_actual", "PlantingAcres")
+  Results[[i]] <- data.frame(Results[[i]])
+  Results[[i]]$Metric <- row.names(Results[[i]])
+  Results[[i]]$TimeBetweenAnalysisandProjection <- TimeWindows[i]
+}
+Results <- rbindlist(Results)
+colnames(Results)[1] <- "Score"
+Results <- spread(Results, Metric, Score)
+#knitr::kable(Results[Results$TimeBetweenAnalysisandProjection == 0 |
+ #                      Results$TimeBetweenAnalysisandProjection == 1], caption = "USDA Model Projection Quality")
+```
+
+## Value - Add Opportunities for BCS
+
+In addition to access to the USDA's publicly available models, the BCS team can access sales data for roughly one third of the US corn market going back to 2006. In theory, sales should directly correspond to acres planted, meaning we should have real time insights that the USDA does not have.
+
+#### Where can the BCS team add value?
+
+ * By creating a model in the fall for the following March that performs better than the +1 year model that is available before the USDA November estimates are released
+ * By creating a model in the fall or winter for the following March that performs better than the 0 year model
+ ```{r}
+
+ ```
+### BCS Proposed Model
+
+The USDA will release projections for up to 9 future years. The objective of this model is to take the available projection for the upcoming year and augment it with our sales data as it becomes available.
+
+While we considered multiple models and evaluated their performance over a variety of sliding windows, here we will present our proposed model. Complete details on the approaches considered are available in the appendix.
+
+The model we use relies on the XGBoost algorithm and trains on 8 years of historical data. We include in-season sales, historical sales, and a variety of other features.
+
+A model using only historical sales and the USDA's +1 projection is the baseline model. This is called the "BeforeOrders" model. As sales data becomes available, we will add in September, October, and November sales. By the end of November, the 0 year USDA projection becomes available; however, this new information does not improve the model. We advise creating a model that starts with the +1 projection and historical sales data (mean average error of about 2 million acres) that can be updated throughout the fall with incoming sales data. After November in-season sales data has been added to the model, we should consider the model projection locked for the following spring.
+
+```{r}
+dataset_1yr <- merge(df[df$TimeBetweenAnalysisandProjection == 1,], Order_National, by.x = "ProjectedYear",
+                 by.y = "MarketYear")
+dataset_1yr <- merge(dataset_1yr, RunningOrder_National, by.x = "ProjectedYear", by.y = "MarketYear")
+dataset_1yr <- create_lag(dataset_1yr, "acre_corn_actual", N = 4)
+dataset_1yr <- dataset_1yr$data
+```
+
+```{r, message=FALSE, warning=FALSE, eval = FALSE}
+#Building the model
+    xgb_mode <- boost_tree() %>%
+      set_mode("regression") %>%
+      set_engine("xgboost")
+
+window <- selected_window
+model_parameters <- c("Sept_lag1.x", "Oct_lag1.x", "Nov_lag1.x",
+                        "Sept_lag1.y", "Oct_lag1.y", "Nov_lag1.y",
+                        "Sept_lag2.x", "Oct_lag2.x", "Nov_lag2.x",
+                        "Sept_lag2.y", "Oct_lag2.y", "Nov_lag2.y")
+
+result_baseline <- get_XGBResults(dataset_1yr, window, model_parameters, "Baseline")
+result_sept <- get_XGBResults(dataset_1yr,window, append(model_parameters, c("Sept.x", "Sept.y")), "SeptSales")
+result_oct <- get_XGBResults(dataset_1yr,window, append(model_parameters, c("Sept.x", "Sept.y",
+                                            "Oct.x", "Oct.y")), "OctSales")
+result_nov <- get_XGBResults(dataset_1yr,window, append(model_parameters, c("Sept.x", "Sept.y",
+                                            "Oct.x", "Oct.y", "Nov.x", "Nov.y")), "NovSales")
+results <- data.frame(rbind(result_baseline, result_sept, result_oct, result_nov))
+```
+
+Below we provide a detailed comparison of the error associated with the USDA projections. The +1 model can be released as early as the December prior to the December of the market year and then refined throughout the fall of the growing season. The 0 model should be released after December of the market year. Details on the +1 model and 0 model are available in the appendix. The error metrics for the USDA, as well as the BCS model, are limited to the time period for which we have sales records (2006 - 2019).
+
+Confidence intervals were developed via block bootstrapping. A discussion of this approach is provided in the appendix. Our 95% confidence range is based on these bootstraps and included in the table below.
+
+Note that the +1 projection published by the USDA outperforms, on average, the 0 year projection from the USDA. This suggests that the USDA is overly responsive to in season variables. In contrast, our model is able to produce estimates that are much better than the USDA projections (MAE = 2.21 for our Pre-Order model as compared to MAE = 3.22 for the USDA +1 projection), and then our model continues to improve as more sales records become available. About 80% of Bayer sales are completed by the end of November, and our model does not improve substantially from December - February. The model error drops to about 1 million acres after November sales records are added, and no gains are observed after November.
+
+
+
+```{r, message=FALSE, warning=FALSE, results=FALSE}
+dataset <- dataset_1yr
+model_parameters <- c("Sept_lag1.x", "Oct_lag1.x", "Nov_lag1.x",
+                        "Sept_lag1.y", "Oct_lag1.y", "Nov_lag1.y",
+                        "Sept_lag2.x", "Oct_lag2.x", "Nov_lag2.x",
+                        "Sept_lag2.y", "Oct_lag2.y", "Nov_lag2.y")
+ResultSummary_BeforeOrders <- get_Results_forMultipleWindows(as.formula(paste("acre_corn_actual~",
+                                                                        paste(model_parameters, collapse="+"))),
+                                                             window_list, "Sliding")
+ResultSummary_BeforeOrders$ModelRun <- "BeforeOrders"
+model_parameters <- append(model_parameters, c("Sept.x", "Sept.y"))
+ResultSummary_throughSept <- get_Results_forMultipleWindows(as.formula(paste("acre_corn_actual~",
+                                                                              paste(model_parameters, collapse="+"))),
+                                                             window_list, "Sliding")
+ResultSummary_throughSept$ModelRun <- "SeptemberOrders"
+model_parameters <- append(model_parameters, c("Oct.x", "Oct.y"))
+ResultSummary_throughOct <- get_Results_forMultipleWindows(as.formula(paste("acre_corn_actual~",
+                                                                             paste(model_parameters, collapse="+"))),
+                                                            window_list, "Sliding")
+ResultSummary_throughOct$ModelRun <- "OctoberOrders"
+model_parameters <- append(model_parameters, c("Nov.x", "Nov.y"))
+ResultSummary_throughNov <- get_Results_forMultipleWindows(as.formula(paste("acre_corn_actual~",
+                                                                            paste(model_parameters, collapse="+"))),
+                                                           window_list, "Sliding")
+ResultSummary_throughNov$ModelRun <- "NovemberOrders"
+ResultSummaryFull <- rbind(ResultSummary_BeforeOrders, ResultSummary_throughSept,
+                           ResultSummary_throughOct, ResultSummary_throughNov)
+```
+
+```{r, message=FALSE, warning=FALSE, results=FALSE}
+dataset_0yr <- merge(df[df$TimeBetweenAnalysisandProjection == 0,], Order_National, by.x = "ProjectedYear",
+                 by.y = "MarketYear")
+dataset_0yr <- merge(dataset_0yr, RunningOrder_National, by.x = "ProjectedYear", by.y = "MarketYear")
+dataset_0yr <- create_lag(dataset_0yr, "acre_corn_actual", N = 4)
+dataset_0yr <- dataset_0yr$data
+dataset <- dataset_0yr
+model_parameters <- c("Sept.x", "Oct.x", "Nov.x",
+                        "Sept.y", "Oct.y", "Nov.y",
+                      "Sept_lag1.x", "Oct_lag1.x", "Nov_lag1.x", "Dec_lag1.x", "Jan_lag1.x", "Feb_lag1.x",
+                      "Sept_lag1.y", "Oct_lag1.y", "Nov_lag1.y", "Dec_lag1.y", "Jan_lag1.y", "Feb_lag1.y",
+                      "Sept_lag2.x", "Oct_lag2.x", "Nov_lag2.x", "Dec_lag2.x", "Jan_lag2.x", "Feb_lag2.x",
+                      "Sept_lag2.y", "Oct_lag2.y", "Nov_lag2.y", "Dec_lag2.y", "Jan_lag2.y", "Feb_lag2.y" )
+ResultSummary_throughNov <- get_Results_forMultipleWindows(as.formula(paste("acre_corn_actual~",
+                                                                      paste(model_parameters, collapse="+"))),
+                                                           window_list, "Sliding")
+ResultSummary_throughNov$ModelRun <- "SepttoNovOrders"
+model_parameters <- append(model_parameters, c("Dec.x", "Dec.y"))
+ResultSummary_throughDec <- get_Results_forMultipleWindows(as.formula(paste("acre_corn_actual~",
+                                                                      paste(model_parameters, collapse="+"))),
+                                                           window_list, "Sliding")
+ResultSummary_throughDec$ModelRun <- "SepttoDecOrders"
+model_parameters <- append(model_parameters, c("Jan.x", "Jan.y"))
+ResultSummary_throughJan <- get_Results_forMultipleWindows(as.formula(paste("acre_corn_actual~",
+                                                                            paste(model_parameters, collapse="+"))),
+                                                           window_list, "Sliding")
+ResultSummary_throughJan$ModelRun <- "SepttoJanOrders"
+model_parameters <- append(model_parameters, c("Feb.x", "Feb.y"))
+ResultSummary_throughFeb <- get_Results_forMultipleWindows(as.formula(paste("acre_corn_actual~",
+                                                                            paste(model_parameters, collapse="+"))),
+                                                           window_list, "Sliding")
+ResultSummary_throughFeb$ModelRun <- "SepttoFebOrders"
+ResultSummaryFull_Winter <- rbind(ResultSummary_throughNov, ResultSummary_throughDec,
+                           ResultSummary_throughJan, ResultSummary_throughFeb)
+```
+
+```{r, message=FALSE, warning=FALSE}
+USDA_0year <- Results[Results$TimeBetweenAnalysisandProjection == 0,]
+USDA_0year$Model <- "USDA 0 Year Projection"
+colnames(USDA_0year) <- c("TimeBetween", "MAE", "MAPE", "MSE", "RMSE", "Model")
+USDA_0year$RMSE <- USDA_0year$RMSE / 10^6
+USDA_1year <- Results[Results$TimeBetweenAnalysisandProjection == 1,]
+USDA_1year$Model <- "USDA 1 Year Projection"
+colnames(USDA_1year) <- c("TimeBetween", "MAE", "MAPE", "MSE", "RMSE", "Model")
+USDA_1year$RMSE <- USDA_1year$RMSE / 10^6
+Baseline_1yr <- ResultSummaryFull[ResultSummaryFull$ModelRun == "BeforeOrders" & ResultSummaryFull$Model == "XGB" & ResultSummaryFull$WindowSize == selected_window,]
+Baseline_1yr <- spread(Baseline_1yr, Metric, Score)
+Baseline_1yr$Model <- "+1 Year Baseline Model"
+September_1yr <- ResultSummaryFull[ResultSummaryFull$ModelRun == "SeptemberOrders" & ResultSummaryFull$Model == "XGB" & ResultSummaryFull$WindowSize == selected_window,]
+September_1yr <- spread(September_1yr, Metric, Score)
+September_1yr$Model <- "Sept XGB Model"
+October_1yr <- ResultSummaryFull[ResultSummaryFull$ModelRun == "OctoberOrders" & ResultSummaryFull$Model == "XGB" & ResultSummaryFull$WindowSize == selected_window,]
+October_1yr <- spread(October_1yr, Metric, Score)
+October_1yr$Model <- "Sept & Oct XGB Model"
+November_1yr <- ResultSummaryFull[ResultSummaryFull$ModelRun == "NovemberOrders" & ResultSummaryFull$Model == "XGB" & ResultSummaryFull$WindowSize == selected_window,]
+November_1yr <- spread(November_1yr, Metric, Score)
+November_1yr$Model <- "Sept - Nov XGB Model"
+Baseline_0yr <- ResultSummaryFull_Winter[ResultSummaryFull_Winter$ModelRun == "SepttoNovOrders" &
+                                           ResultSummaryFull_Winter$Model == "XGB" &
+                                           ResultSummaryFull_Winter$WindowSize==selected_window,]
+Baseline_0yr <- spread(Baseline_0yr, Metric, Score)
+Baseline_0yr$Model <- "0 Year Baseline Model"
+Dec_0yr <- ResultSummaryFull_Winter[ResultSummaryFull_Winter$ModelRun == "SepttoDecOrders" &
+                                           ResultSummaryFull_Winter$Model == "XGB" &
+                                           ResultSummaryFull_Winter$WindowSize==selected_window,]
+Dec_0yr <- spread(Dec_0yr, Metric, Score)
+Dec_0yr$Model <- "December Model"
+Jan_0yr <- ResultSummaryFull_Winter[ResultSummaryFull_Winter$ModelRun == "SepttoJanOrders" &
+                                           ResultSummaryFull_Winter$Model == "XGB" &
+                                           ResultSummaryFull_Winter$WindowSize==selected_window,]
+Jan_0yr <- spread(Jan_0yr, Metric, Score)
+Jan_0yr$Model <- "January Model"
+Feb_0yr <- ResultSummaryFull_Winter[ResultSummaryFull_Winter$ModelRun == "SepttoFebOrders" &
+                                           ResultSummaryFull_Winter$Model == "XGB" &
+                                           ResultSummaryFull_Winter$WindowSize==selected_window,]
+Feb_0yr <- spread(Feb_0yr, Metric, Score)
+Feb_0yr$Model <- "February Model"
+resultsnames <- c("Model", "MAE", "MAPE", "RMSE")
+cleanedResultsComparison <- rbind(data.frame(USDA_1year)[,resultsnames],
+      data.frame(USDA_0year)[,resultsnames],
+      data.frame(Baseline_1yr)[,resultsnames],
+      data.frame(September_1yr)[,resultsnames],
+      data.frame(October_1yr)[,resultsnames],
+      data.frame(November_1yr)[,resultsnames],
+      data.frame(Baseline_0yr)[,resultsnames],
+      data.frame(Dec_0yr)[,resultsnames],
+      data.frame(Jan_0yr)[,resultsnames],
+      data.frame(Feb_0yr)[,resultsnames])
+forDisplay <- cleanedResultsComparison[,c("Model", "MAE")]
+```
+```{r, message=FALSE, warning=FALSE}
+#Reading in bootstraps
+block_baseline_1yr <- read.csv(".././randomforest/bootstrapresults/windows8to14_bootstrap_Baseline1yr.csv")
+stationary_baseline_1yr <- read.csv(".././randomforest/bootstrapresults/stationarybootstrap_Baseline1yr.csv")
+block_baseline_Sept <- read.csv(".././randomforest/bootstrapresults/windows8to14_bootstrap_Sept.csv")
+stationary_baseline_Sept <- read.csv(".././randomforest/bootstrapresults/stationarybootstrap_Sept1yr.csv")
+block_baseline_Oct <- read.csv(".././randomforest/bootstrapresults/windows8to14_bootstrap_Oct.csv")
+stationary_baseline_Oct <- read.csv(".././randomforest/bootstrapresults/stationarybootstrap_Oct1yr.csv")
+block_baseline_Nov <- read.csv(".././randomforest/bootstrapresults/windows8to14_bootstrap_Nov.csv")
+stationary_baseline_Nov <- read.csv(".././randomforest/bootstrapresults/stationarybootstrap_Nov1yr.csv")
+block_baseline_0yr <- read.csv(".././randomforest/bootstrapresults/windows8to14_bootstrap_Baseline0yr.csv")
+block_baseline_Dec <- read.csv(".././randomforest/bootstrapresults/windows8to14_bootstrap_Dec.csv")
+block_baseline_Jan <- read.csv(".././randomforest/bootstrapresults/windows8to14_bootstrap_Jan.csv")
+block_baseline_Feb <- read.csv(".././randomforest/bootstrapresults/windows8to14_bootstrap_Feb.csv")
+CI_stationary_1yr <- get_CI(stationary_baseline_1yr, "Stationary")
+CI_stationary_Sept <- get_CI(stationary_baseline_Sept, "Stationary")
+CI_stationary_Oct <- get_CI(stationary_baseline_Oct, "Stationary")
+CI_stationary_Nov <- get_CI(stationary_baseline_Nov, "Stationary")
+CI_block_1yr <- get_CI(block_baseline_1yr, "Block")
+CI_block_Sept <- get_CI(block_baseline_Sept, "Block")
+CI_block_Oct <- get_CI(block_baseline_Oct, "Block")
+CI_block_Nov <- get_CI(block_baseline_Nov, "Block")
+CI_block_0yr <- get_CI(block_baseline_0yr, "Block")
+CI_block_Dec <- get_CI(block_baseline_Dec, "Block")
+CI_block_Jan <- get_CI(block_baseline_Jan, "Block")
+CI_block_Feb <- get_CI(block_baseline_Feb, "Block")
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+USDA_0year <- Results[Results$TimeBetweenAnalysisandProjection == 0,]
+USDA_0year$Model <- "USDA -7 months"
+colnames(USDA_0year) <- c("TimeBetween", "MAE", "MAPE", "MSE", "RMSE", "Model")
+USDA_0year$RMSE <- USDA_0year$RMSE / 10^6
+USDA_1year <- Results[Results$TimeBetweenAnalysisandProjection == 1,]
+USDA_1year$Model <- "USDA -19 months"
+colnames(USDA_1year) <- c("TimeBetween", "MAE", "MAPE", "MSE", "RMSE", "Model")
+USDA_1year$RMSE <- USDA_1year$RMSE / 10^6
+resultsnames <- c("Model", "MAE")
+forDisplay_L <- data.frame("Model" = rep(" ", 4), "MAE" = rep(" ", 4), stringsAsFactors = FALSE)
+forDisplay_L[1,] <- data.frame(USDA_1year)[,resultsnames]
+forDisplay_R <- data.frame("Model" = c("BCS -19 months", "BCS -9 months",
+                                       "BCS -8 months", "BCS -7 months"),
+                           "MAE (point model)" = forDisplay[3:6, "MAE"],
+                           "Confidence Interval (95%)" = c(paste0("(", CI_block_1yr[1,1], ", ", CI_block_1yr[1,2], ")"),
+                                     paste0("(", CI_block_Sept[1,1], ", ", CI_block_Sept[1,2], ")"),
+                                     paste0("(", CI_block_Oct[1,1], ", ", CI_block_Oct[1,2], ")"),
+                                     paste0("(", CI_block_Nov[1,1], ", ", CI_block_Nov[1,2], ")")))
+forDisplay <- cbind(forDisplay_L, forDisplay_R)
+MAEs <- knitr::kable(forDisplay, align = c(rep('c', 5)), caption = "Error Metrics Associated with Different Models", booktabs = T,
+                     col.names = c("Model", "MAE (Mill. Acres)",
+                                   "Model", "MAE (Mill. Acres)",
+                                   "95% Conf Int (Mill. Acres)"))
+add_footnote(MAEs, c("All month counts relative to June of confirmed planting acreage year",
+                     "Model performance improvements cease to be observed after the addition of November sales data",
+                     "Mean Absolute Error (MAE) based on 6 years of testing data"), notation = "symbol")
+```
+
+### A Word of Caution
+
+We caution readers of this document that we are working with a limited set of data. We have sales records starting in 2006. If we rely on 8 years of training data, as in the model outlined in this main body of the document, this only leaves 6 years of data to test on. When we compare our model residuals - that is, the absolute value of the difference between our model predictions and the ground truth number - our model demonstrates a much more consistent behavior than the USDA's models, and generally outperforms the USDA. 
+
+```{r}
+USDA_residuals <- df[df$TimeBetweenAnalysisandProjection == 0 | df$TimeBetweenAnalysisandProjection == 1,]
+USDA_residuals$residual <- abs(USDA_residuals$PlantingAcres - USDA_residuals$acre_corn_actual)
+USDA_residuals$TimeBetweenAnalysisandProjection <- as.factor(USDA_residuals$TimeBetweenAnalysisandProjection)
+xgb_mode <- boost_tree() %>%
+  set_mode("regression") %>%
+  set_engine("xgboost")
+model_parameters <- c( "Sept_lag1.x", "Oct_lag1.x", "Nov_lag1.x",
+                       "Sept_lag1.y", "Oct_lag1.y", "Nov_lag1.y",
+                       "Sept_lag2.x", "Oct_lag2.x", "Nov_lag2.x",
+                       "Sept_lag2.y", "Oct_lag2.y", "Nov_lag2.y",
+                      "acre_corn_actual_lag1", "acre_corn_actual_lag2",
+                      "acre_corn_actual_lag3", "acre_corn_actual_lag4" )
+dataset <- dataset_1yr
+baseline <- WrapUpResiduals(dataset, model_parameters, c(8))
+november <- WrapUpResiduals(dataset, append(model_parameters, c("Sept.x", "Sept.y",
+                                                                "Oct.x", "Oct.y",
+                                                                "Nov.x", "Nov.y")), c(8))
+dataset <- dataset_0yr
+model_parameters <- c("Sept.x", "Oct.x", "Nov.x",
+                        "Sept.y", "Oct.y", "Nov.y",
+                      "Sept_lag1.x", "Oct_lag1.x", "Nov_lag1.x", "Dec_lag1.x", "Jan_lag1.x", "Feb_lag1.x",
+                      "Sept_lag1.y", "Oct_lag1.y", "Nov_lag1.y", "Dec_lag1.y", "Jan_lag1.y", "Feb_lag1.y",
+                      "Sept_lag2.x", "Oct_lag2.x", "Nov_lag2.x", "Dec_lag2.x", "Jan_lag2.x", "Feb_lag2.x",
+                      "Sept_lag2.y", "Oct_lag2.y", "Nov_lag2.y", "Dec_lag2.y", "Jan_lag2.y", "Feb_lag2.y",
+                      "acre_corn_actual_lag1", "acre_corn_actual_lag2",
+                      "acre_corn_actual_lag3", "acre_corn_actual_lag4" )
+baseline_inseason <- WrapUpResiduals(dataset, model_parameters, c(8))
+february <- WrapUpResiduals(dataset, append(model_parameters, c("Dec.x", "Dec.y", "Jan.x", "Jan.y",
+                                                                "Feb.x", "Feb.y")), c(8))
+shared_colnames <- c("Year", "Residual", "Group")
+df1 <- USDA_residuals[, c("ProjectedYear", "residual", "TimeBetweenAnalysisandProjection")]
+df2 <- baseline[baseline$window == 8, c("YearofAnalysis", "residual", "window")]
+df2$window <- "Baseline"
+df3 <- november[, c("YearofAnalysis", "residual", "window")]
+df3$window <- "Nov."
+df4 <- baseline_inseason[, c("YearofAnalysis", "residual", "window")]
+df4$window <- "Baseline, In Season"
+df5 <- february[, c("YearofAnalysis", "residual", "window")]
+df5$window <- "Feb."
+colnames(df1) <- shared_colnames
+colnames(df2) <- shared_colnames
+colnames(df3) <- shared_colnames
+colnames(df4) <- shared_colnames
+colnames(df5) <- shared_colnames
+resids_for_plot <- data.frame(rbind(df1, df2, df5))
+rm(df1, df2, df3, df4, df5)
+resids_for_plot$Group <- as.factor(resids_for_plot$Group)
+levels(resids_for_plot$Group) <- list(USDA_0year="0", USDA_1year="1", XGBModel_Baseline="Baseline",
+                                      XGBModel_Nov = "Nov.", XGBModel_InSeasonBaseline = "Baseline, In Season",
+                                      XGBModel_Feb = "Feb.")
+resids_for_plot$Year <- as.numeric(resids_for_plot$Year)
+ggplot(resids_for_plot, aes(x = Year, y = Residual, colour = Group, fill = Group, group = Group)) +
+  geom_point() + geom_line() +
+  theme_bw() + theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, vjust = 0.85, hjust=1)) +
+  xlim(c(2014, 2019)) + ylim(c(0, 10^7))
+
+```
+
+However, use of 2014 - 2019 may mask the true variability in historical plantings. Recall the first plot of the document where acreage plantings have varied wildly in the last 100 years, even though recent history has suggested a relatively steady increase in planting acreage from year to year. We can even see this in a residual plot looking at the behavior of the USDA's in season (0) and 1 year prior to season (1) models. There are several years (e.g. 1993 - 1996, 2007 - 2008) with very large residuals outside of the 2014 - 2019 testing window we have available for our model.
+
+```{r}
+ggplot(USDA_residuals, aes(x = ProjectedYear, y = residual, colour = TimeBetweenAnalysisandProjection,
+                           fill = TimeBetweenAnalysisandProjection, group = TimeBetweenAnalysisandProjection)) +
+  geom_point() + geom_line() +
+  theme_bw() + theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, vjust = 0.85, hjust=1)) +
+  xlab("Year") + ylab("Residual (acres)") + labs(fill = "USDA Model", group = "USDA Model", colour = "USDA Model")
+```
+
+### Farther Out Projections
+
+The USDA releases projections up to 9 years out in their annual report. We are unable to test our model on this wide range of years due to the limits of sales data. Below we attempt to apply the BCS model that relies historical sales data to predict corn acreage planting for up to 5 years out. We compare the model projections to the USDA's projections and find that the USDA does a substantially better job.
+
+```{r, warnings = FALSE, messages = FALSE, eval = TRUE}
+Sales$MissingSale <- 0
+Sales[is.na(Sales$Orders)]$MissingSale <- 1
+Sales[is.na(Sales)] <- 0
+NationalSales <- Sales[Sales$Brand == "NATIONAL", c("MarketYear", "Month", "Orders", "OrdersRunningTotal", "MissingSale")]
+NationalSales_list <- get_formattedDF(NationalSales)
+NationalSales_Running <- NationalSales_list[[1]]
+NationalSales_Monthly <- NationalSales_list[[2]]
+futurewindow <- 2
+dataset <- merge(df[df$TimeBetweenAnalysisandProjection == futurewindow,], NationalSales_Running, by.x = "YearofAnalysis",
+                 by.y = "MarketYear") #Matching sales to WHEN USDA GENERATED REPORT. Important difference from other stuff
+dataset <- merge(dataset, NationalSales_Monthly, by.x = "YearofAnalysis",
+                 by.y = "MarketYear")
+dataset <- create_lag(dataset, "acre_corn_actual", futurewindow)$data
+dataset_prior <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 1),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior) <- c("YearofAnalysis", "PlantingAcres_plus1")
+dataset <- merge(dataset, dataset_prior)
+#The window of years in this dataset is the window of years that will be used to calculate USDA accuracy
+dataset <- dataset[dataset$ProjectedYear < 2020,]
+model_parameters <- c("Run_Sept_lag1", "Run_Sept_lag2", "Month_Sept_lag1", "Month_Sept_lag2",
+                      "Run_Oct_lag1", "Run_Oct_lag2", "Month_Oct_lag1", "Month_Oct_lag2",
+                      "Run_Nov_lag1", "Run_Nov_lag2", "Month_Nov_lag1", "Month_Nov_lag2",
+                      "Run_Dec_lag1", "Run_Dec_lag2", "Month_Dec_lag1", "Month_Dec_lag2",
+                      "Run_MissingLag1", "Run_MissingLag2", "Month_MissingLag1", "Month_MissingLag2",
+                      "PlantingAcres", "PlantingAcres_plus1")
+window_list <- c(5, 6, 7, 8)
+Plus2_list <- get_Results(model_parameters, window_list)
+futurewindow <- 3
+dataset <- merge(df[df$TimeBetweenAnalysisandProjection == futurewindow,], NationalSales_Running, by.x = "YearofAnalysis",
+                 by.y = "MarketYear") #Matching sales to WHEN USDA GENERATED REPORT. Important difference from other stuff
+dataset <- merge(dataset, NationalSales_Monthly, by.x = "YearofAnalysis",
+                 by.y = "MarketYear")
+dataset <- create_lag(dataset, "acre_corn_actual", futurewindow)$data
+dataset_prior <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 1),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior) <- c("YearofAnalysis", "PlantingAcres_plus1")
+dataset <- merge(dataset, dataset_prior)
+dataset_prior2 <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 2),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior2) <- c("YearofAnalysis", "PlantingAcres_plus2")
+dataset <- merge(dataset, dataset_prior2)
+model_parameters <- c("Run_Sept_lag1", "Run_Sept_lag2", "Month_Sept_lag1", "Month_Sept_lag2",
+                      "Run_Oct_lag1", "Run_Oct_lag2", "Month_Oct_lag1", "Month_Oct_lag2",
+                      "Run_Nov_lag1", "Run_Nov_lag2", "Month_Nov_lag1", "Month_Nov_lag2",
+                      "Run_Dec_lag1", "Run_Dec_lag2", "Month_Dec_lag1", "Month_Dec_lag2",
+                      "Run_MissingLag1", "Run_MissingLag2", "Month_MissingLag1", "Month_MissingLag2",
+                      "PlantingAcres", "PlantingAcres_plus1", "PlantingAcres_plus2")
+Plus3_list <- get_Results(model_parameters, c(5, 6, 7))
+futurewindow <- 4
+dataset <- merge(df[df$TimeBetweenAnalysisandProjection == futurewindow,], NationalSales_Running, by.x = "YearofAnalysis",
+                 by.y = "MarketYear") #Matching sales to WHEN USDA GENERATED REPORT. Important difference from other stuff
+dataset <- merge(dataset, NationalSales_Monthly, by.x = "YearofAnalysis",
+                 by.y = "MarketYear")
+dataset <- create_lag(dataset, "acre_corn_actual", futurewindow)$data
+dataset_prior <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 1),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior) <- c("YearofAnalysis", "PlantingAcres_plus1")
+dataset <- merge(dataset, dataset_prior)
+dataset_prior2 <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 2),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior2) <- c("YearofAnalysis", "PlantingAcres_plus2")
+dataset <- merge(dataset, dataset_prior2)
+dataset_prior3 <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 3),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior3) <- c("YearofAnalysis", "PlantingAcres_plus3")
+dataset <- merge(dataset, dataset_prior3)
+model_parameters <- c("Run_Sept_lag1", "Run_Sept_lag2", "Month_Sept_lag1", "Month_Sept_lag2",
+                      "Run_Oct_lag1", "Run_Oct_lag2", "Month_Oct_lag1", "Month_Oct_lag2",
+                      "Run_Nov_lag1", "Run_Nov_lag2", "Month_Nov_lag1", "Month_Nov_lag2",
+                      "Run_Dec_lag1", "Run_Dec_lag2", "Month_Dec_lag1", "Month_Dec_lag2",
+                      "Run_MissingLag1", "Run_MissingLag2", "Month_MissingLag1", "Month_MissingLag2",
+                      "PlantingAcres", "PlantingAcres_plus1", "PlantingAcres_plus2",
+                      "PlantingAcres_plus3")
+Plus4_list <- get_Results(model_parameters, c(5, 6))
+futurewindow <- 5
+rm(dataset)
+dataset <- merge(df[df$TimeBetweenAnalysisandProjection == futurewindow,], NationalSales_Running, by.x = "YearofAnalysis",
+                 by.y = "MarketYear") #Matching sales to WHEN USDA GENERATED REPORT. Important difference from other stuff
+dataset <- merge(dataset, NationalSales_Monthly, by.x = "YearofAnalysis",
+                 by.y = "MarketYear")
+dataset <- create_lag(dataset, "acre_corn_actual", futurewindow)$data
+dataset_prior <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 1),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior) <- c("YearofAnalysis", "PlantingAcres_plus1")
+dataset <- merge(dataset, dataset_prior)
+dataset_prior2 <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 2),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior2) <- c("YearofAnalysis", "PlantingAcres_plus2")
+dataset <- merge(dataset, dataset_prior2)
+dataset_prior3 <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 3),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior3) <- c("YearofAnalysis", "PlantingAcres_plus3")
+dataset <- merge(dataset, dataset_prior3)
+dataset_prior4 <- (df[df$TimeBetweenAnalysisandProjection == (futurewindow - 4),c("YearofAnalysis", "PlantingAcres")])
+colnames(dataset_prior4) <- c("YearofAnalysis", "PlantingAcres_plus4")
+dataset <- merge(dataset, dataset_prior4)
+model_parameters <- c("Run_Sept_lag1", "Run_Sept_lag2", "Month_Sept_lag1", "Month_Sept_lag2",
+                      "Run_Oct_lag1", "Run_Oct_lag2", "Month_Oct_lag1", "Month_Oct_lag2",
+                      "Run_Nov_lag1", "Run_Nov_lag2", "Month_Nov_lag1", "Month_Nov_lag2",
+                      "Run_Dec_lag1", "Run_Dec_lag2", "Month_Dec_lag1", "Month_Dec_lag2",
+                      "Run_MissingLag1", "Run_MissingLag2", "Month_MissingLag1", "Month_MissingLag2",
+                      "PlantingAcres", "PlantingAcres_plus1", "PlantingAcres_plus2",
+                      "PlantingAcres_plus3", "PlantingAcres_plus4")
+Plus5_list <- get_Results(model_parameters, c(5))
+MAE <- rbind(Plus2_list[[2]], Plus3_list[[2]], Plus4_list[[2]], Plus5_list[[2]])
+#MAE$Projection <- c(rep("Plus2", 5), rep("Plus3", 4), rep("Plus4", 3), rep("Plus5", 2))
+RealValues <- rbind(Plus2_list[[1]][Plus2_list[[1]]$Window == 7,],
+                    Plus3_list[[1]][Plus3_list[[1]]$Window == 7,],
+                    Plus4_list[[1]][Plus4_list[[1]]$Window == 7,],
+                    Plus5_list[[1]][Plus5_list[[1]]$Window == 7,])
+#RealValues$Projection <- c(rep("Plus2", 4), rep("Plus3", 4), rep("Plus4", 3), rep("Plus5", 2))
+tmp <- RealValues[1:4,]
+tmp$Projection <- "USDA"
+RealValues <- rbind(RealValues, tmp)
+RealValues$ProjectedYear <- as.numeric(as.character(RealValues$ProjectedYear))
+RealValues$USDA_delta <- abs(RealValues$USDAProjection - RealValues$actual)
+RealValues$Model_delta <- abs(RealValues$.pred - RealValues$actual)
+FarOutModelFrame <- merge(data.table(RealValues[!(RealValues$Projection == "USDA"),])[, mean(USDA_delta) / 10^6, by = list(Projection)],
+data.table(RealValues[!(RealValues$Projection == "USDA"),])[, mean(Model_delta) / 10^6, by = list(Projection)], by = "Projection")
+colnames(FarOutModelFrame) <- c("Projection", "USDA Projection MAE", "BCS Model MAE")
+FarOutModelFrame$`USDA Projection MAE` <- round(FarOutModelFrame$`USDA Projection MAE`, 2)
+FarOutModelFrame$`BCS Model MAE` <- round(FarOutModelFrame$`BCS Model MAE`, 2)
+knitr::kable(FarOutModelFrame, caption = "MAE in Millions of Acres for Far Looking Forecasts")
+```
+
+We would not recommend placing a high degree of confidence on these projections or the relative performance of the USDA vs. the BCS model. As you can see in the plot below, there are very few datapoints available for testing. We used a 7 year moving window for training. As a result, there are only two years available for the Plus5 projection. This is limited by the availability of historical sales data. Actual historic planting values are shown in black in the plot below.
+
+```{r, eval = TRUE}
+ggplot(RealValues, aes(x = ProjectedYear)) + geom_point(aes(y = .pred, fill = Projection, colour = Projection)) +
+  geom_point(aes(y = actual)) + theme_bw() + xlab("Year") + ylab("Acres Planted")
+```
+
+
+## Conclusions
+From our work, we conclude the following:
+
+ * The USDA in-season projection is slightly worse than the USDA one-year-prior projection.
+ * The BCS team can produce a model that substantially outperforms the publicly available USDA model, as early as the December before the start of the market year (e.g. December 2019 for the March 2021 planting)
+ * The BCS team can refine this model throughout the fall, with the final useful information being added at the end of December.
+ * The BCS team can provide estimates that represent between a 30% and 70% reduction in error, depending on when the estimates are produced.
+ * Enthusiasm with respect to these results should be tempered by the knowledge that true variability may not be observed in the 6 years of available testing data. Testing of these results on future years - or with older sales data - is necessary.
+ * The USDA appears better equipped than the proposed BCS model to project plantings 2 - 5 years in the future; however, there are very few test years available. We do not have a high degree of confidence in the estimated MAE for 2 - 5 year future projections.
+
+
+
+\newpage
+
+## Appendix
+
+### Model Features List
+
+Our baseline model includes the following features:
+
+ * Net national brand orders in September, 1 and 2 years prior
+ * Net national brand orders in October, 1 and 2 years prior
+ * Net national brand orders in November, 1 and 2 years prior
+ * Net national brand orders in December, 1 and 2 years prior
+ * Running total of national brand orders for Sept - Oct, 1 and 2 years prior
+ * Running total of national brand orders for Sept - Nov, 1 and 2 years prior
+ * Running total of national brand orders for Sept - Dec, 1 and 2 years prior
+ * USDA Projections for the upcoming year
+
+On a rolling basis, monthly sales totals are added.
+
+### +1 Model Year Details
+The USDA will release projections for up to 9 future years. The objective of this model is to take the available projection for the upcoming year and augment it with our sales data. We will consider two different models (Random Forest (RF) and XGBoost (XGB)) and compare them to the available published USDA model. With our sales-augmented models, we will include the following features:
+
+ * Net national brand orders in September, 1 and 2 years prior
+ * Net national brand orders in October, 1 and 2 years prior
+ * Net national brand orders in November, 1 and 2 years prior
+ * Net national brand orders in December, 1 and 2 years prior
+ * Running total of national brand orders for Sept - Oct, 1 and 2 years prior
+ * Running total of national brand orders for Sept - Nov, 1 and 2 years prior
+ * Running total of national brand orders for Sept - Dec, 1 and 2 years prior
+ * USDA Projections for the upcoming year
+
+Further, we will simulate the progression of the fall. We will create a model with the above features. This will be the baseline model for the upcoming year, called the "BeforeOrders" model. As sales data becomes available, we will add in September, October, and November sales. By the end of November, the 0 year USDA model becomes available. At that point, it probably makes more sense to use the newer published numbers and shift modeling approaches.
+
+For these models, we will train on a range of windows, using between 6 and 9 years of data. We will calculate error metrics based on this sliding window. In the plotted error metrics below, we see that both the random forest and XGBoost models outperform the published USDA numbers. In all cases, even using sales data from 1 and 2 years prior are sufficiently informative as to make the BeforeOrders model better than the published USDA model. The XGBoost model performs better than the random forest model for nearly all cases, so we will discuss that further.
+
+
+
+```{r, message=FALSE, warning=FALSE}
+ggplot(ResultSummaryFull[ResultSummaryFull$Metric == "MAE",], aes(x = WindowSize, y = Score,
+                                                                   fill = ModelRun, colour = ModelRun)) +
+  geom_line(alpha = 0.8) + theme_bw() + facet_wrap(~Model) + theme(legend.position = "bottom") +
+  ggtitle("Mean Absolute Error")
+```
+
+From these results, we can conclude the following:
+
+ * The BCS team can produce a model that outperforms the publicly available USDA model in the fall
+ * The BCS team can refine this model throughout the season
+
+
+### 0 Year Model Details
+
+The model described in the previous section outperforms the projections made by the USDA for planting one year out. In November, the USDA will release new projections for the following March. The objective of this model is to take the new USDA Projections, released in November, and augment them with our sales information in order to see if we can improve projections.
+
+Similar to before, we will start with a base model, in this case a model that uses both the new USDA projections and sales records from September through November. We will subsequently add December, January, and February orders. And again we find that both models are better than the USDA numbers, and the XGBoost model is the best performing model. Much like before when the addition of one month's sales records does not yield an improvement, but two months' sales records does; we see that the model that includes sales records through December has a consistently strong performance.
+
+
+```{r, message=FALSE, warning=FALSE}
+ggplot(ResultSummaryFull_Winter[ResultSummaryFull_Winter$Metric == "MAE",], aes(x = WindowSize, y = Score,
+                                                                   fill = ModelRun, colour = ModelRun)) +
+  geom_line(alpha = 0.8) + theme_bw() + facet_wrap(~Model) + theme(legend.position = "bottom") +
+  ggtitle("Mean Absolute Error")
+```
+
+From these results, we can conclude the following:
+
+ * The BCS team can produce a model that outperforms the publicly available updated USDA model in the spring
+ * The BCSteam can refine this model throughout the season
+ * The USDA performs worse in season, and this initial noise introduce by the USDA projection negatively impacts the baseline spring BCS model. After additional sales data is added, the BCS model improves beyond the best available fall numbers.
+
+\newpage
+### Bootstrapped Distributions
+
+I tried using 2 methods to get boostrapped error distributions:
+
+ * Block Bootstrapping
+ * Stationary Bootstrapping
+
+For both methods, for each bootstrap I generated 20 models and then calculated the MAE for that set of 20 models. I used 500 bootstraps. I only included sliding windows of size 8 to 14 in the block bootstrap approach. With stationary bootstrapping, you create a time series of 14 years every time, because that was the available data. I would expect the block bootstrap to yield a lower average MAE than the stationary.
+
+These bootstraps were calculated in an external script (BootstrappingErrorMetrics_v2), saved as .csv's, and read back in. It takes several hours for all bootstraps to be calculated, so the raw script to generate these bootstraps could not be included in the RMD.
+
+#### Baseline Model
+
+```{r}
+get_DistPlot(block_baseline_1yr, stationary_baseline_1yr)
+```
+
+\newpage
+
+#### September Model
+```{r}
+get_DistPlot(block_baseline_Sept, stationary_baseline_Sept)
+```
+
+\newpage
+
+#### October Model
+```{r}
+get_DistPlot(block_baseline_Oct, stationary_baseline_Oct)
+```
+
+\newpage
+
+#### November Model
+```{r}
+get_DistPlot(block_baseline_Nov, stationary_baseline_Nov)
+```
+
+
+### Jitter Test
+
+In order to test model robustness, we will apply the jitter test. We will increase the amount by which we perturb the response variable and then compare the MAE from the original (pertubation free) model to the jittered models. If the model is working properly, the MAE will get progressively worse as the jitter increases. That is what we see in the figure below.
+
+```{r, message=FALSE, warning=FALSE, results=FALSE}
+jitterFactor <- c(0, 5, 50, 500, 5000, 50000)
+jitterResults <- list()
+model_parameters <- c("Sept_lag1.x", "Oct_lag1.x", "Nov_lag1.x",
+                       "Sept_lag1.y", "Oct_lag1.y", "Nov_lag1.y",
+                       "Sept_lag2.x", "Oct_lag2.x", "Nov_lag2.x",
+                       "Sept_lag2.y", "Oct_lag2.y", "Nov_lag2.y")
+for(i in 1:length(jitterFactor)){
+  dataset <- merge(df[df$TimeBetweenAnalysisandProjection == 1,], Order_National, by.x = "ProjectedYear",
+                 by.y = "MarketYear")
+  dataset <- merge(dataset, RunningOrder_National, by.x = "ProjectedYear", by.y = "MarketYear")
+  dataset$acre_corn_actual <- jitter(dataset$acre_corn_actual, factor = jitterFactor[i])
+  ResultSummary_BeforeOrders <- get_Full_Model(model_parameters, window_list, "BeforeOrders", TypeofWindow)
+  jitterResults[[i]] <- data.frame(ResultSummary_BeforeOrders)[ResultSummary_BeforeOrders$Model == "XGB" &
+                                                     ResultSummary_BeforeOrders$Metric == "MAE" &
+                                                     ResultSummary_BeforeOrders$WindowSize == 7, "Score"]
+}
+jitterResults <- data.frame(jitterResults)
+jitterPlot <- data.frame("MAE" = t(jitterResults), "Jitter" = jitterFactor)
+```
+
+```{r}
+ggplot(jitterPlot, aes(x = Jitter, y = MAE)) + geom_point() + theme_bw()
+```
+
+### Permutation Test
+
+Another way to assess model robustness is to randomly shuffle the years of the dataset. If we break the link between years and the response variable, the model should break. If it doesn't, the model requires further examination. Here we compare the MAE of the unshuffled model to the shuffled model.
+
+```{r, message=FALSE, warning=FALSE, results=FALSE}
+  dataset <- merge(df[df$TimeBetweenAnalysisandProjection == 1,], Order_National, by.x = "ProjectedYear",
+                 by.y = "MarketYear")
+  dataset <- merge(dataset, RunningOrder_National, by.x = "ProjectedYear", by.y = "MarketYear")
+  shuffledResults <- list()
+
+  ResultSummary_BeforeOrders <- get_Full_Model(model_parameters, window_list, "BeforeOrders", TypeofWindow)
+  shuffledResults[[1]] <- data.frame(ResultSummary_BeforeOrders)[ResultSummary_BeforeOrders$Model == "XGB" &
+                                                     ResultSummary_BeforeOrders$Metric == "MAE" &
+                                                     ResultSummary_BeforeOrders$WindowSize == selected_window, "Score"]
+  dataset <- transform( dataset, acre_corn_actual = sample(acre_corn_actual) )
+  ResultSummary_BeforeOrders <- get_Full_Model(model_parameters, window_list, "BeforeOrders", TypeofWindow)
+  shuffledResults[[2]] <- data.frame(ResultSummary_BeforeOrders)[ResultSummary_BeforeOrders$Model == "XGB" &
+                                                     ResultSummary_BeforeOrders$Metric == "MAE" &
+                                                     ResultSummary_BeforeOrders$WindowSize == selected_window, "Score"]
+shuffledResults <- data.frame(shuffledResults)
+colnames(shuffledResults) <- c("OriginalMAE", "ShuffledMAE")
+```
+
+```{r}
+knitr::kable(shuffledResults, caption = "Results of Shuffle Test")
+```
