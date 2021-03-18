@@ -1,0 +1,331 @@
+---
+title: "weather analysis"
+author: "Song Yuanhong"
+date: \today
+
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  
+header-includes: 
+- \usepackage{setspace}\onehalfspacing
+
+fontsize: 11pt
+geometry: left=2cm,right=2cm,top=2cm,bottom=2cm
+---
+
+Weather imapact on corn growth:
+
+- Planting (March to June): not to cool, ideally a dry and warm soil. Cold and wet weather prevent good soil drainage; Drough is not a concern at this season while rainfall in the spring is likely to worsen the already water-logged field in Midwest
+- Silking (June to Aug): stress in this stage is going to hurt the yield deeply
+- Strong wind during the whole life cycle
+
+Quick Reference:
+
+- What weather events are impacting the corn growth
+
+https://www.farmprogress.com/corn/10-keys-high-corn-yields
+
+- What are the weather indecies:
+
+https://climatedataguide.ucar.edu/climate-data/overview-climate-indices
+
+
+Questions looking for in this analysis:
+
+- cold/freeze in March, April
+- rain in March, April, May
+- heat in June, July, Aug
+- drought in June, July, Aug
+- freeze in last December as a indicator for a spring outlook
+
+
+Raw weather data gathered:
+
+- _cooling degree of days:_ A cooling degree day is every degree that the mean temperature is above 65 degrees during a day. So, if the high temperature for the day is 95, and the minimum is 51, the average temperature for the day is 73. That would be 8 cooling degree days (73-65). Monthly average
+- _heating degree of days:_
+- _precipitation:_ monthly precipitation average
+- _palmer drought severity index (PDSI):_ The Palmer Drought Severity Index (PDSI), calculated from a combination of precipitation, temperature, and soil moisture data. It represents the accumulation or deficit of water over a long-term period, about 9 months. The PDSI is a standardized measure, ranging from about -10 (dry) to +10 (wet) with values below -3 representing severe to extreme drought. The PDSI was designed to be strongly auto-correlated in order to account for the impact of land memory on drought conditions
+- _palmer z index (zndx):_ The Z-Index corresponds to monthly drought conditions with no memory to previous monthly deficits or surpluses, can be used to track short-term agricultural drought, since it responds quickly to changes in soil moisture.
+- _tavg:_ monthly atmosphere temperature average
+- _tmax:_ monthly atmosphere temperature max
+- _tmin:_ monthly atmosphere temperature min
+
+
+Weather features:
+
+- number of days below freeze criteria in March, April
+- number of days above heating criteria in June, July
+- total rainfall in March to Aug each year, looking for wet Mar, Apl, May and dry June, July, Aug
+- freeze in last December as a indicator for a spring outlook
+
+```{r setup, echo = F, include=FALSE, message=F, warning=F}
+devtools::load_all("../BPI/")
+pkg <- c("data.table", "dplyr", "ggplot2", "ggpubr", "kableExtra",  "glmnet", "ranger")
+lapply(pkg, library, character.only = T)
+
+#' Create lags for column of interest
+#'
+create_lag <- function(data, columns, N = 4){
+  datadf <- copy(data)
+  
+  if(!all(columns %in% names(data))){
+    stop("some columns are not in the data")
+  }
+  
+  lead_col_name = c()
+  for(col in columns){
+    for(lagN in 1:N){lead_col_name = append(lead_col_name, paste0(col, "_lag", lagN))}
+  }
+  
+  lagdf <- datadf[, shift(.SD, n=1:N, fill = NA, type = "lag"), .SDcols = columns]
+  colnames(lagdf) <- lead_col_name
+  
+  outputdf <- cbind(datadf, lagdf)
+  
+  return(list(data = outputdf, lag_col = lead_col_name))
+}
+
+
+#' Create leads for column of interest
+#'
+create_lead <- function(data, columns, N = 4){
+  datadf <- copy(data)
+  
+  if(!all(columns %in% names(data))){
+    stop("some columns are not in the data")
+  }
+  
+  lead_col_name = c()
+  for(col in columns){
+    for(leadN in 1:N){lead_col_name = append(lead_col_name, paste0(col, "_lead", leadN))}
+  }
+  
+  leaddf <- datadf[, shift(.SD, n=1:N, fill = NA, type = "lead"), .SDcols = columns]
+  colnames(leaddf) <- lead_col_name
+  
+  outputdf <- cbind(datadf, leaddf)
+  
+  return(list(data = outputdf, lead_col = lead_col_name))
+}
+```
+
+```{r, echo=F, message=F, warning=F}
+weather <- read_myweather("../data/raw/weather/")
+
+annual_spring_rain <- weather[month %in% c("03", "04", "05"), c("pcp", "year")]
+annual_spring_rain[, sp_rain := sum(pcp), by = year]
+annual_spring_rain[, pcp := NULL]
+annual_spring_rain <- unique(annual_spring_rain)
+
+annual_spring_temp <- weather[month %in% c("03", "04", "05"), c("tavg", "year")]
+annual_spring_temp[, sp_tavg := mean(tavg), by = year]
+annual_spring_temp[, tavg := NULL]
+annual_spring_temp <- unique(annual_spring_temp)
+
+annual_summer_rain <-  weather[month %in% c("06", "07", "08"), c("pcp", "year")]
+annual_summer_rain[, sm_rain := sum(pcp), by = year]
+annual_summer_rain[, pcp := NULL]
+annual_summer_rain <- unique(annual_summer_rain)
+
+annual_summer_temp <-  weather[month %in% c("06", "07", "08"), c("tmax", "year")]
+annual_summer_temp[, sm_tavg := mean(tmax), by = year]
+annual_summer_temp[, tmax := NULL]
+annual_summer_temp <- unique(annual_summer_temp)
+
+annual_pdsi <- weather[, c("pdsi", "year")]
+annual_pdsi[, avg_pdsi := mean(pdsi), by = year]
+annual_pdsi[, pdsi := NULL]
+annual_pdsi <- unique(annual_pdsi)
+
+annual_summer_z <- weather[month %in% c("06", "07", "08"), c("zndx", "year")]
+annual_summer_z[, sm_z := mean(zndx), by = year]
+annual_summer_z[, zndx := NULL]
+annual_summer_z <- unique(annual_summer_z)
+
+annual_spring_z <- weather[month %in% c("03", "04", "05"), c("zndx", "year")]
+annual_spring_z[, sp_z := mean(zndx), by = year]
+annual_spring_z[, zndx := NULL]
+annual_spring_z <- unique(annual_spring_z)
+
+w_summary <- merge(annual_spring_rain, annual_spring_temp) %>%
+  merge(annual_summer_rain) %>%
+  merge(annual_summer_temp) %>%
+  merge(annual_pdsi) %>%
+  merge(annual_spring_z) %>%
+  merge(annual_summer_z) 
+
+w_summary <- w_summary[w_summary$year>1923 & w_summary$year<2020, ]
+w_summary[, year := as.numeric(year)] %>% glimpse()
+weather_features <- names(w_summary)[!names(w_summary) %in% "year"]
+```
+
+
+```{r, echo=F}
+main <- fread("pooled_usda.csv")
+main <- merge(main, w_summary)
+main[, acre_planted_corn_lead1 := shift(acre_planted_corn, n=1, type = "lead")]
+main[, acre_planted_corn_lead2 := shift(acre_planted_corn, n=2, type = "lead")]
+main[, yield_corn_lead1 := shift(yield_corn, n=1, type = "lead")]
+main[, acre_planted_corn_lag1 := shift(acre_planted_corn, n=1, type = "lag")]
+main[, yield_corn_lag1 := shift(yield_corn, n=1, type = "lag")]
+
+```
+
+
+
+```{r echo=F}
+yp1 <- ggplot(main)+
+  geom_line(aes(x = year, y = yield_corn)) +
+  theme_classic() +
+  labs(title = "Corn yield increase with time")
+```
+
+
+```{r echo=F}
+yield_trend <- lm(yield_corn ~ year, data=main)
+main[, yield_corn_detrend := residuals(yield_trend)]
+
+main[, yld_diff := yield_corn - yield_corn_lag1]
+main[, yld_diff_ln := log(yld_diff-min(yld_diff, na.rm = T))]
+
+yp2 <- ggplot(main)+
+  geom_line(aes(x = year, y = yield_corn_detrend)) +
+  theme_classic() +
+  labs(title = "Corn yield detrended (linear trend)")
+
+yp3 <- ggplot(main)+
+  geom_line(aes(x = year, y = yld_diff)) +
+  theme_classic() +
+  labs(title = "Corn yield increase (current yield minus last yield)")
+
+yp4 <- ggplot(main)+
+  geom_line(aes(x = year, y = yld_diff_ln)) +
+  theme_classic() +
+  labs(title = "log corn yield increase")
+
+ggarrange(yp1, yp2, yp3, yp4, ncol = 2, nrow = 2)
+```
+
+
+```{r echo=F}
+most_dry <- main[order(avg_pdsi), year] 
+most_wet <- main[order(-avg_pdsi), year] 
+best_yield_increase <- main[order(-yld_diff), year]
+best_yield_detrend <- main[order(-yield_corn_detrend), year]
+most_acre <- main[order(-acre_planted_corn), year]
+```
+
+```{r echo=F}
+ggplot() +
+  geom_line(data =weather, aes(x = month, y = zndx, group = year), color = "gray80") +
+  geom_line(data= weather[year %in% most_dry[1:5], ], aes(x = month, y = zndx, group = year, color = year)) +
+  labs(title = "Most dry years short term drought, negative for dryness, positive for wetness") +
+  theme_classic()
+```
+
+
+```{r, echo=F, fig.cap="rank of biggest yield increase: 1994 2013 1989 1984 1992"}
+ggplot() +
+  geom_line(data =weather, aes(x = month, y = pdsi, group = year), color = "gray80") +
+  geom_line(data= weather[year%in% best_yield_increase[1:5],  ], aes(x = month, y = pdsi, group = year, color = year)) +
+  labs(title = "Plot the long term drought index (Z-index), negative for dryness, positive for wetness, rank of biggest yield increase: 1994 2013 1989 1984 1992")+
+  theme_classic()
+
+```
+
+
+```{r echo=F,fig.cap="Current year YIELD vs WEATHER"}
+PerformanceAnalytics::chart.Correlation(main[, c("acre_planted_corn", "sp_z", "sm_z", "sp_tavg", "sm_tavg", "sp_rain", "sm_rain")],  histogram=F)
+```
+
+```{r echo=F,fig.cap="ACREAGE-LEAD-1 vs WEATHER"}
+PerformanceAnalytics::chart.Correlation(main[, c("acre_planted_corn_lead1", "sp_z", "sm_z", "sp_tavg", "sm_tavg", "sp_rain", "sm_rain")],  histogram=F)
+```
+
+```{r echo=F,fig.cap="Current year YIELD DIFFERENCE vs WEATHER"}
+PerformanceAnalytics::chart.Correlation(main[, c("yld_diff", "sp_z", "sm_z", "sp_tavg", "sm_tavg", "sp_rain", "sm_rain")],  histogram=F)
+```
+
+```{r fig.cap="Acreage, yield lead(1) vs spring Z-index, summer Z-index"}
+PerformanceAnalytics::chart.Correlation(main[, c("acre_planted_corn_lead1", "sp_z", "sm_z", "sp_tavg", "sm_tavg", "sp_rain", "sm_rain")],  histogram=F)
+```
+
+```{r echo = F}
+main_narm <- na.omit(main)
+x = data.matrix(main_narm[, c("sp_z", "sm_z", "sp_tavg", "sm_tavg", "sp_rain", "sm_rain")])
+y = main_narm$acre_planted_corn_lead1
+acre_lasso <- cv.glmnet(x, y, alpha = 1, family = "gaussian", type.measure = "mse", nfolds = 5, nlambda = 1000)
+acre_lasso$lambda.min
+plot(acre_lasso)
+coef(acre_lasso, s = "lambda.min")
+
+pd <- predict(acre_lasso, s = acre_lasso$lambda.min, x)
+(cor(pd, y))^2
+
+# 18%
+```
+
+
+```{r echo = F}
+main_narm <- na.omit(main)
+x = data.matrix(main_narm[, c("sp_z", "sm_z", "sp_tavg", "sm_tavg", "sp_rain", "sm_rain")])
+y = main_narm$yield_corn
+acre_lasso <- cv.glmnet(x, y, alpha = 1, family = "gaussian", type.measure = "mse", nfolds = 5, nlambda = 1000)
+acre_lasso$lambda.min
+plot(acre_lasso)
+coef(acre_lasso, s = "lambda.min")
+
+pd <- predict(acre_lasso, s = acre_lasso$lambda.min, x)
+(cor(pd, y))^2
+
+# 35%
+```
+
+# 8/24
+
+
+```{r}
+leads <- create_lead(main, "acre_planted_corn", 9)
+main <- leads$data
+col <- c("sm_tavg", "acre_planted_corn", leads$lead_col)
+PerformanceAnalytics::chart.Correlation(main[, ..col],  histogram=F)
+
+lags <- create_lag(main, "sm_tavg", 9)
+main <- lags$data
+col <- c("acre_planted_corn", lags$lag_col)
+PerformanceAnalytics::chart.Correlation(main[, ..col],  histogram=F)
+```
+
+```{r}
+colnames(main) <- make.unique(names(main))
+ggplot(main[year>1959,]) +
+  geom_vline(xintercept = seq(1960, 2020, 5), color = "gray20") +
+  geom_vline(xintercept = seq(1960, 2020, 1), color = "gray95") +
+  geom_line(aes(x= year, y = sm_tavg/20-3, color = "summer temp")) +
+  # geom_line(aes(x= year, y = acre_planted_corn/1E8, color = "acre current cropyear")) +
+  geom_line(aes(x= year, y = acre_planted_corn_lead1/1E8, color = "acre lead crop year")) +
+  theme_classic()
+
+```
+
+```{r}
+weather <- read_myweather("../data/raw/weather/")
+cornbelt_sm_tavg <- weather[month %in% c("06", "07", "08"), c("tavg.y", "year")]
+cornbelt_sm_tavg[, cb_sm_tavg := sum(tavg.y), by = year]
+cornbelt_sm_tavg[, tavg.y := NULL]
+cornbelt_sm_tavg <- unique(cornbelt_sm_tavg)
+
+cornbelt_sm_z <- weather[month %in% c("06", "07", "08"), c("zndx.y", "year")]
+cornbelt_sm_z[, cb_sm_z := mean(zndx.y), by = year]
+cornbelt_sm_z[, zndx.y := NULL]
+cornbelt_sm_z <- unique(cornbelt_sm_z)
+
+cornbelt <- merge(cornbelt_sm_tavg, cornbelt_sm_z)
+main <- merge(main, cornbelt, by = year, all.x = T)
+
+w_summary <- w_summary[w_summary$year>1923 & w_summary$year<2020, ]
+w_summary[, year := as.numeric(year)] %>% glimpse()
+weather_features <- names(w_summary)[!names(w_summary) %in% "year"]
+```

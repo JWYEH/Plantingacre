@@ -1,0 +1,262 @@
+---
+title: "weather analysis - states"
+author: "Song Yuanhong"
+date: \today
+output: html_document
+---
+
+```{r setup, echo = F, include=FALSE, message=F, warning=F}
+devtools::load_all("../BPI/")
+pkg <- c("data.table", "dplyr", "ggplot2", "ggpubr", "kableExtra",  "glmnet", "ranger")
+lapply(pkg, library, character.only = T)
+
+#' Create lags for column of interest
+#'
+create_lag <- function(data, columns, N = 4){
+  datadf <- copy(data)
+  
+  if(!all(columns %in% names(data))){
+    stop("some columns are not in the data")
+  }
+  
+  lead_col_name = c()
+  for(col in columns){
+    for(lagN in 1:N){lead_col_name = append(lead_col_name, paste0(col, "_lag", lagN))}
+  }
+  
+  lagdf <- datadf[, shift(.SD, n=1:N, fill = NA, type = "lag"), .SDcols = columns]
+  colnames(lagdf) <- lead_col_name
+  
+  outputdf <- cbind(datadf, lagdf)
+  
+  return(list(data = outputdf, lag_col = lead_col_name))
+}
+
+
+#' Create leads for column of interest
+#'
+create_lead <- function(data, columns, N = 4){
+  datadf <- copy(data)
+  
+  if(!all(columns %in% names(data))){
+    stop("some columns are not in the data")
+  }
+  
+  lead_col_name = c()
+  for(col in columns){
+    for(leadN in 1:N){lead_col_name = append(lead_col_name, paste0(col, "_lead", leadN))}
+  }
+  
+  leaddf <- datadf[, shift(.SD, n=1:N, fill = NA, type = "lead"), .SDcols = columns]
+  colnames(leaddf) <- lead_col_name
+  
+  outputdf <- cbind(datadf, leaddf)
+  
+  return(list(data = outputdf, lead_col = lead_col_name))
+}
+```
+
+
+
+```{r echo = F, message=F, warning=F}
+main <- fread("pooled_usda_states.csv")[year>1959, ]
+```
+
+
+
+```{r corn acre st-dev, echo = F, message=F, warning=F}
+sd_acre <- main[, sqrt(var(acre_corn)), by = state]
+farm_region <- unique(main[, c("state", "region")])
+sd_acre <- na.omit(merge(sd_acre, farm_region))
+names(sd_acre)[names(sd_acre) %in% "V1"] <- "acre_sd"
+sd_acre$region <- factor(sd_acre$region, levels = unique(sd_acre$region))
+
+highVar_state <- sd_acre[order(-acre_sd), state][1:10]
+
+ggplot(sd_acre) +
+  geom_hline(yintercept = seq(0E00, 1.5E6, 1E5), color = "gray80")+
+  geom_col(aes(x = reorder(state, acre_sd), y = acre_sd, fill = region)) +
+  scale_y_continuous(breaks = seq(0E00, 1.5E6, 1E5), labels = paste(seq(0, 1.5, 0.1), " M")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, size = 8)) +
+  ggtitle("Acreage standard deviation by states in million acres")
+```
+
+```{r cron acre coef of var, echo = F, message=F, warning=F}
+cv_acre <- main[, sqrt(var(acre_corn))/mean(acre_corn), by = state] %>%
+  merge(farm_region) %>%
+  na.omit() 
+
+names(cv_acre)[names(cv_acre) %in% "V1"] <- "acre_cv"
+cv_acre$region <- factor(cv_acre$region, levels = unique(cv_acre$region))
+
+highCV_state <- cv_acre[order(-acre_cv), state][1:10]
+
+ggplot(cv_acre) +
+  geom_hline(yintercept = seq(0,1,.1), color = "gray80", size = 0.3)+
+  geom_col(aes(x = reorder(state, acre_cv), y = acre_cv, fill = region)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, size = 8)) +
+  ggtitle("Acreage coefficient of variance")
+```
+
+
+
+```{r acre time trend, fig.width=8, echo = F, message=F, warning=F}
+ggplot(main[year>2000 & state %in% highVar_state,]) + 
+  geom_vline(xintercept = 2001:2019, color = "gray70", size = 0.3) +
+  geom_line(aes(x = year, y = acre_corn, color = state_name)) +
+  scale_y_continuous(breaks = seq(0E00, 1E8, 1E6), labels = paste0(seq(0, 100, 1), " M")) +
+  scale_x_continuous(breaks = seq(2001, 2020, 2), labels = seq(2001, 2020, 2)) +
+  theme_classic() +
+  ggtitle("Corn acreage time series: the high variance states")
+
+ggplot(main[year>2000 & state %in% highCV_state,]) + 
+  geom_vline(xintercept = 2001:2019, color = "gray70", size = 0.3) +
+  geom_line(aes(x = year, y = acre_corn, color = state_name)) +
+  scale_y_continuous(breaks = seq(0E00, 1E8, 1E6), labels = paste0(seq(0, 100, 1), " M")) +
+  scale_x_continuous(breaks = seq(2001, 2020, 2), labels = seq(2001, 2020, 2)) +
+  theme_classic() +
+  ggtitle("Corn acreage time series: the high CV states")
+```
+```{r, echo = F, message=F, warning=F}
+mean_acre <- main[, mean(acre_corn), by = state] %>%
+  merge(farm_region) %>%
+  na.omit() %>%
+  glimpse()
+
+high_mean_state <- mean_acre[order(-V1), state][1:10]
+
+ggplot(main[year>2000 & state %in% high_mean_state,]) + 
+  geom_vline(xintercept = 2001:2019, color = "gray70", size = 0.3) +
+  geom_line(aes(x = year, y = acre_corn, color = state_name)) +
+  scale_y_continuous(breaks = seq(0E00, 1E8, 1E6), labels = paste0(seq(0, 100, 1), " M")) +
+  scale_x_continuous(breaks = seq(2001, 2020, 2), labels = seq(2001, 2020, 2)) +
+  theme_classic() +
+  ggtitle("Corn acreage time series: the high mean states")
+
+```
+```{r echo = F, message=F, warning=F}
+weather_al <- read_myweather("../data/raw/weather/al/")
+
+annual_summer_tavg <- weather_al[month %in% c("06", "07", "08"), c("tavg", "year")]
+annual_summer_tavg[, sm_tavg := sum(tavg), by = year]
+annual_summer_tavg[, tavg := NULL]
+annual_summer_tavg <- unique(annual_summer_tavg)
+
+annual_summer_z <- weather_al[month %in% c("06", "07", "08"), c("zndx", "year")]
+annual_summer_z[, sm_z := mean(zndx), by = year]
+annual_summer_z[, zndx := NULL]
+annual_summer_z <- unique(annual_summer_z)
+
+w_summary <- merge(annual_summer_tavg, annual_summer_z)
+w_summary[, year := as.numeric(year)]
+w_summary$state <- "AL"
+weather_features <- names(w_summary)[!names(w_summary) %in% "year"]
+
+main <- merge(main, w_summary, by = c("year", "state"), all.x = T)
+
+# --------
+# weather_nd <- read_myweather("../data/raw/weather/nd/")
+# 
+# annual_summer_tavg <- weather_nd[month %in% c("06", "07", "08"), c("tavg", "year")]
+# annual_summer_tavg[, sm_tavg := sum(tavg), by = year]
+# annual_summer_tavg[, tavg := NULL]
+# annual_summer_tavg <- unique(annual_summer_tavg)
+# 
+# annual_summer_z <- weather_nd[month %in% c("06", "07", "08"), c("zndx", "year")]
+# annual_summer_z[, sm_z := mean(zndx), by = year]
+# annual_summer_z[, zndx := NULL]
+# annual_summer_z <- unique(annual_summer_z)
+# 
+# w_summary <- merge(annual_summer_tavg, annual_summer_z)
+# w_summary[, year := as.numeric(year)]
+# w_summary$state <- "ND"
+# weather_features <- names(w_summary)[!names(w_summary) %in% "year"]
+# 
+# main <- merge(main, w_summary, by = c("year", "state"), all.x = T)
+```
+
+
+
+
+```{r}
+al <- main[state %in% "AL", ]
+
+PerformanceAnalytics::chart.Correlation(main[, c("acre_planted_corn", "sm_z", "sm_tavg")],  histogram=F)
+lags <- create_lag(main, "sm_tavg", 9)
+main <- lags$data
+col <- c("acre_planted_corn", lags$lag_col)
+PerformanceAnalytics::chart.Correlation(main[year>1959, ..col],  histogram=F)
+```
+
+
+```{r}
+lags <- create_lag(main, "sm_z", 9)
+main <- lags$data
+col <- c("acre_planted_corn", lags$lag_col)
+PerformanceAnalytics::chart.Correlation(main[year>1959, ..col],  histogram=F)
+```
+
+
+
+
+```{r, echo = F, message=F, warning=F}
+sd_acre_soy <- main[, sqrt(var(acre_soy)), by = state]
+sd_acre_soy <- na.omit(merge(sd_acre_soy, farm_region))
+names(sd_acre_soy)[names(sd_acre_soy) %in% "V1"] <- "acre_sd_soy"
+sd_acre_soy$region <- factor(sd_acre_soy$region, levels = unique(sd_acre_soy$region))
+
+ggplot(sd_acre_soy) +
+  geom_hline(yintercept = seq(0E00, 3E6, 1E5), color = "gray80")+
+  geom_col(aes(x = reorder(state, acre_sd_soy), y = acre_sd_soy, fill = region)) +
+  scale_y_continuous(breaks = seq(0E00, 3E6, 1E5)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, size = 8)) 
+```
+
+```{r, echo = F, message=F, warning=F}
+sd_yield <- main[, sqrt(var(yield_corn)), by = state]
+sd_yield <- na.omit(merge(sd_yield, farm_region))
+names(sd_yield)[names(sd_yield) %in% "V1"] <- "yield_sd"
+sd_yield$region <- factor(sd_yield$region, levels = unique(sd_yield$region))
+
+ggplot(sd_yield) +
+  geom_hline(yintercept = seq(0E00, 75, 5), color = "gray80")+
+  geom_col(aes(x = reorder(state, yield_sd), y = yield_sd, fill = region)) +
+  scale_y_continuous(breaks = seq(0E00, 75, 10)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, size = 8)) 
+```
+
+
+
+```{r}
+# loessMod <- loess(yield_corn ~ year, data=main, span=0.1)
+# main$yd_c_trend <- predict(loessMod)
+# main$yd_c_detrend <- residuals(loessMod)
+# 
+# ggplot(main) +
+#   geom_line(aes(x = year, y = yd_c_trend, color = "yield trend")) +
+#   geom_line(aes(x = year, y = yield_corn, color = "yeild")) +
+#   geom_line(aes(x = year, y = yd_c_detrend, color = "yield detrend"))
+```
+
+
+```{r}
+# PerformanceAnalytics::chart.Correlation(main[, c("acre_planted_corn", "sm_z", "sm_tavg")],  histogram=F)
+# 
+# lags <- create_lag(main, "sm_tavg", 9)
+# main <- lags$data
+# col <- c("acre_planted_corn", lags$lag_col)
+# PerformanceAnalytics::chart.Correlation(main[year>1959, ..col],  histogram=F)
+
+```
+
+
+```{r}
+# lags <- create_lag(main, "sm_z", 9)
+# main <- lags$data
+# col <- c("acre_planted_corn", lags$lag_col)
+# PerformanceAnalytics::chart.Correlation(main[year>1959, ..col],  histogram=F)
+```

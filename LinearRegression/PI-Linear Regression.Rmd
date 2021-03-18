@@ -1,0 +1,400 @@
+---
+title: "Planting Intentions - Linear Regression"
+author: "Song Yuanhong"
+date: \today
+output:
+  html_document:
+    toc: true
+    toc_float: true
+
+header-includes:
+- \usepackage{setspace}\onehalfspacing
+
+fontsize: 11pt
+geometry: left=2cm,right=2cm,top=2cm,bottom=2cm
+---
+
+```{r setup, echo = F, include=FALSE, message=F, warning=F}
+devtools::load_all("../BPI/")
+pkg <- c("data.table", "dplyr", "ggplot2", "kableExtra", "tseries", "forecast", "readxl", "glmnet")
+lapply(pkg, library, character.only = T)
+```
+
+
+```{r read data, echo=F}
+acre <- fread("../data/raw/acreplanted_national_corn_nass_1926-2020.csv")
+price <- fread("../data/raw/price_soy_corn_doe_1866-2019.csv")
+
+main <- merge(acre, price, all.x = T)
+main <- main[Year!=2020, c("Year", "CORN - ACRES PLANTED  -  <b>VALUE</b>","inflation_adj_ind", "corn_adjusted", "soy_adjusted")]
+names(main) <- c("year", "acre_corn","inflation_adj_ind", "price_corn", "price_soy")
+main[, acre_corn:=rm_comma(acre_corn)]
+main[, pratio_cornsoy := price_corn/price_soy]
+main[, acre_norm_corn := get_normalized(acre_corn)]
+
+
+acre_soy <- fread("../data/raw/acreplanted_national_soy_nass_1924-2020.csv")
+acre_soy <- acre_soy[Period=="YEAR", c("Year", "Value")]
+names(acre_soy) <- c("year", "acre_soy")
+main <- merge(main, acre_soy, all.x = T)
+main[, acre_soy:=rm_comma(acre_soy)]
+main[, acre_norm_soy := get_normalized(acre_soy)]
+```
+
+```{r plot raw, echo=F}
+scaler = 0.3*10E6
+ggplot(main, aes(x= year)) +
+  geom_col(aes(y = acre_corn),  fill = "gray70", color = "gray90") +
+  geom_line(aes(y = acre_corn, color = "acre corn"), size = 1) +
+  geom_line(aes(y = price_corn*scaler,color = "price corn"), size = 1) +
+  geom_line(aes(y = price_soy*scaler,color = "price soy"),  size = 1) +
+  scale_y_continuous(name = "acre planted (acre)",sec.axis = sec_axis(~. /scaler, name = "USD/BU adjusted by CPI"))
+```
+
+# 8/7 ACF analysis
+
+```{r ts plot, echo=F, fig.width=8, fig.height=4}
+acre_ts <- ts(main$acre_corn, start = min(main$year))
+plot(acre_ts)
+par(mfrow=c(1,2))
+acf(acre_ts, lag.max=20, main = NULL)
+pacf(acre_ts, lag.max=20, main = NULL)
+par(mfrow=c(1,1))
+```
+
+ACF and PACF looks like AR(1) model, maybe a random walk. Need to test for stationarity.
+Statinarity rejected.
+
+```{r df test}
+summary(urca::ur.df(acre_ts, type = "none", lags= 0))
+adf.test(acre_ts)
+auto.arima(acre_ts)
+```
+
+
+```{r differencing and test}
+acre_ts_df1 <- diff(acre_ts)
+auto.arima(acre_ts_df1)
+adf.test(acre_ts_df1)
+```
+
+
+```{r plot diff, echo=F}
+plot.ts(acre_ts_df1)
+par(mfrow=c(1,2))
+acf(acre_ts_df1, lag.max=20, main = NULL)
+pacf(acre_ts_df1, lag.max=20, main = NULL)
+par(mfrow=c(1,1))
+```
+
+
+
+Based on the time series plot No transformation will be taken.
+
+```{r echo=F}
+MASS::boxcox((acre_ts_df1-min(acre_ts_df1) +1E-2) ~ 1, lambda = seq(-2, 2, .1), plotit = T)
+```
+
+```{r cost return data, echo = F, warning=F, message=F}
+rev_75 <- read_excel("../data/raw/us_corn_cost_return_1975-1995.xls")
+rev_75 <- rev_75[c(2, 44, 55, 59, 60), 1:22]
+rev_75 <- transpose(rev_75)
+names(rev_75) <- c("year", "gross_prod_yera", "cost_corn", "price_corn", "yield_corn")
+rev_75 <- rev_75[-1, ]
+
+rev_96 <- read_excel("../data/raw/us_corn_cost_return_1996-2019.xlsx")
+rev_96 <- rev_96[c(6, 14, 60, 66, 64), 1:25]
+rev_96 <- transpose(rev_96)
+names(rev_96) <- c("year", "gross_prod_yera", "cost_corn", "price_corn", "yield_corn")
+rev_96 <- rev_96[-1, ]
+
+rev_corn <- rbind(rev_75, rev_96)
+rev_corn <- data.frame(apply(rev_corn, 2, as.numeric))
+rev_corn$cost_per_acre_corn <- rev_corn$price_corn*rev_corn$yield_corn
+
+main <- merge(main, rev_corn[, c("year", "cost_per_acre_corn", "yield_corn")], all.x = T)
+main[, cost_per_acre_corn := cost_per_acre_corn*inflation_adj_ind]
+```
+
+```{r}
+mean_cost <- mean(main$cost_per_acre_corn, na.rm = T)
+mean_yield_corn <- mean(main$yield_corn, na.rm = T)
+main[is.na(cost_per_acre_corn), cost_per_acre_corn := mean_cost]
+main[is.na(yield_corn), yield_corn := mean_yield_corn]
+```
+
+
+```{r echo=F}
+create_lag <- function(data, columns, N = 4){
+  datadf <- copy(data)
+
+  if(!all(columns %in% names(data))){
+    stop("some columns are not in the data")
+  }
+
+  lag_col_name = c()
+  for(col in columns){
+    for(lagN in 1:N){lag_col_name = append(lag_col_name, paste0(col, "_lag", lagN))}
+  }
+
+  lagdf <- datadf[, shift(.SD, n=1:N, fill = 0, type = "lag"), .SDcols = columns]
+  colnames(lagdf) <- lag_col_name
+
+  outputdf <- cbind(datadf, lagdf)
+
+  return(list(data = outputdf, lag_col = lag_col_name))
+}
+
+```
+
+```{r}
+lag_obj <- create_lag(data = main, columns = c("acre_corn", "pratio_cornsoy", "acre_soy", "cost_per_acre_corn", "yield_corn"), N=2)
+main <- lag_obj$data
+lag_col <- lag_obj$lag_col
+```
+
+# 8/10 Linear Regression
+
+```{r}
+(fm <- paste0("acre_corn ~ ", paste0(lag_obj$lag_col, collapse = " + ")))
+
+range(main$year)
+# 1/3 for training
+train_ind <- main$year <1988
+
+summary(lr_full <- lm(fm, data = main[train_ind,]))
+summary(lr_reduce <- MASS::stepAIC(lr_full, trace=F))
+
+lr_pred <- predict(lr_reduce, newdata = main[!train_ind,])
+rmse <- get_rmse(y = main[!train_ind, acre_corn], yhat = lr_pred)
+round(rmse/1E6, 2)
+
+mae <- get_mae(y = main[!train_ind, acre_corn], yhat = lr_pred)
+round(mae/1E6, 2)
+
+ggplot(data = data.frame(obs = main[!train_ind, acre_corn], pred = lr_pred))+
+  geom_point(aes(x = obs, y = pred))+
+  geom_abline(intercept = 0, slope = 1, color = "1:1 reference")+
+  geom_smooth(aes(x = obs, y = pred), method = 'loess',formula = 'y ~ x')
+```
+
+# 8/11 Random Forest
+
+```{r echo=F, message=F, warning=F}
+library(randomForest)
+library(ranger)
+```
+
+```{r}
+cols <- c("acre_corn", lag_col)
+
+train_dt <- main[train_ind, ..cols]
+test_dt <- main[!train_ind, ..cols]
+
+hyper_grid <- expand.grid(mtry = 2:10,
+                          node_size = seq(3, 9, by = 2),
+                          sample_size = c(.55, .632, .70, .80),
+                          OOB_RMSE = 0)
+nrow(hyper_grid)
+
+for(i in 1:nrow(hyper_grid)) {
+  # train model
+  model <- ranger(
+    formula         = acre_corn ~ .,
+    data            = train_dt,
+    num.trees       = 500,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$node_size[i],
+    sample.fraction = hyper_grid$sample_size[i],
+    seed            = 2022
+  )
+  hyper_grid$OOB_RMSE[i] <- sqrt(model$prediction.error)
+}; beepr::beep(2)
+
+hyper_grid %>%
+  dplyr::arrange(OOB_RMSE) %>%
+  head(10)
+
+
+OOB_RMSE <- vector(mode = "numeric", length = 100)
+for(i in seq_along(OOB_RMSE)) {
+  optimal_ranger <- ranger(
+    formula         = acre_corn ~ .,
+    data            = train_dt,
+    num.trees       = 500,
+    mtry            = 3,
+    min.node.size   = 3,
+    sample.fraction = 0.8,
+    importance      = 'permutation'
+  )
+  OOB_RMSE[i] <- sqrt(optimal_ranger$prediction.error)
+}; beepr::beep(2)
+hist(OOB_RMSE/1E6, breaks = 50)
+
+
+importance <- data.frame(
+  mean_decrease_accuracy = optimal_ranger$variable.importance,
+  feature = names(optimal_ranger$variable.importance))
+
+ggplot(data = importance) +
+  geom_col(aes(y = mean_decrease_accuracy, x = reorder(feature, mean_decrease_accuracy))) +
+  coord_flip() +
+  ggtitle("Important Variables, by Mean Decrease in Accuracy")
+
+
+rf_fit <- ranger(
+  formula = acre_corn ~ .,
+  data = train_dt,
+  num.trees = 500,
+  mtry = 3,
+  min.node.size = 3,
+  sample.fraction = 0.8,
+  importance = 'permutation'
+)
+rf_pred <- predict(rf_fit, data = test_dt)
+rf_rmse <- get_rmse(y = test_dt$acre_corn, yhat = rf_pred$predictions)
+rf_mae <- get_mae(y = test_dt$acre_corn, yhat = rf_pred$predictions)
+
+round(rf_rmse/1E6,2)
+round(rf_mae/1E6,2)
+```
+
+# 8/13 GLMNET
+```{r}
+xtrain <- model.matrix(acre_corn ~., train_dt)[, -1]
+ytrain <- train_dt$acre_corn
+
+xtest <- model.matrix(acre_corn ~., test_dt)[, -1]
+ytest <- test_dt$acre_corn
+
+set.seed(2022)
+glmnet_cv <- cv.glmnet(xtrain, ytrain, alpha = 1, family = "gaussian",
+                       type.measure = "mse", nfolds = 5, nlambda = 1000)
+glmnet_cv$lambda.min
+plot(glmnet_cv)
+coef(glmnet_cv, s = "lambda.min")
+
+glmnet_pd_train <- predict(glmnet_cv, s = glmnet_cv$lambda.min, xtrain)
+plot(ytrain, glmnet_pd_train, pch = 19, col = "brown")
+abline(lm(glmnet_pd_train~ytrain), col = "tan")
+abline(0,1, col = "gray50")
+mtext(paste0("TRAIN RMSE: ",round(get_rmse(ytrain, glmnet_pd_train)/1E6, 2)))
+
+
+glmnet_pd_test<- predict(glmnet_cv, s = glmnet_cv$lambda.min, xtest)
+plot(ytest, glmnet_pd_test, pch = 19, col = "brown")
+abline(lm(glmnet_pd_test~ytest), col = "tan")
+abline(0,1, col = "gray50")
+mtext(paste0("TEST RMSE: ",round(get_rmse(ytest, glmnet_pd_test)/1E6, 2)))
+```
+
+```{r}
+(fm <- paste0("acre_corn ~ ", paste0(lag_obj$lag_col, collapse = " + ")))
+
+range(main$year)
+# 1/3 for training
+train_ind <- main$year <1988
+
+summary(lr_full <- lm(fm, data = main[train_ind,]))
+summary(lr_reduce <- MASS::stepAIC(lr_full, trace=F))
+
+lr_pred <- predict(lr_reduce, newdata = main[!train_ind,])
+rmse <- get_rmse(y = main[!train_ind, acre_corn], yhat = lr_pred)
+round(rmse/1E6, 2)
+
+mae <- get_mae(y = main[!train_ind, acre_corn], yhat = lr_pred)
+round(mae/1E6, 2)
+
+ggplot(data = data.frame(obs = main[!train_ind, acre_corn], pred = lr_pred))+
+  geom_point(aes(x = obs, y = pred))+
+  geom_abline(intercept = 0, slope = 1, color = "1:1 reference")+
+  geom_smooth(aes(x = obs, y = pred), method = 'loess',formula = 'y ~ x')
+```
+
+# 8/11 Random Forest
+
+```{r echo=F, message=F, warning=F}
+library(randomForest)
+library(ranger)
+```
+
+```{r}
+cols <- c("acre_corn", lag_col)
+
+train_dt <- main[train_ind, ..cols]
+test_dt <- main[!train_ind, ..cols]
+
+hyper_grid <- expand.grid(mtry = 2:10,
+                          node_size = seq(3, 9, by = 2),
+                          sample_size = c(.55, .632, .70, .80),
+                          OOB_RMSE = 0)
+nrow(hyper_grid)
+
+for(i in 1:nrow(hyper_grid)) {
+  # train model
+  model <- ranger(
+    formula         = acre_corn ~ .,
+    data            = train_dt,
+    num.trees       = 500,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$node_size[i],
+    sample.fraction = hyper_grid$sample_size[i],
+    seed            = 2022
+  )
+  hyper_grid$OOB_RMSE[i] <- sqrt(model$prediction.error)
+}; beepr::beep(2)
+
+hyper_grid %>%
+  dplyr::arrange(OOB_RMSE) %>%
+  head(10)
+
+
+OOB_RMSE <- vector(mode = "numeric", length = 100)
+for(i in seq_along(OOB_RMSE)) {
+  optimal_ranger <- ranger(
+    formula         = acre_corn ~ .,
+    data            = train_dt,
+    num.trees       = 500,
+    mtry            = 3,
+    min.node.size   = 3,
+    sample.fraction = 0.8,
+    importance      = 'permutation'
+  )
+  OOB_RMSE[i] <- sqrt(optimal_ranger$prediction.error)
+}; beepr::beep(2)
+hist(OOB_RMSE/1E6, breaks = 50)
+
+
+importance <- data.frame(
+  mean_decrease_accuracy = optimal_ranger$variable.importance,
+  feature = names(optimal_ranger$variable.importance))
+
+ggplot(data = importance) +
+  geom_col(aes(y = mean_decrease_accuracy, x = reorder(feature, mean_decrease_accuracy))) +
+  coord_flip() +
+  ggtitle("Important Variables, by Mean Decrease in Accuracy")
+
+
+rf_fit <- ranger(
+  formula = acre_corn ~ .,
+  data = train_dt,
+  num.trees = 500,
+  mtry = 3,
+  min.node.size = 3,
+  sample.fraction = 0.8,
+  importance = 'permutation'
+)
+rf_pred <- predict(rf_fit, data = test_dt)
+rf_rmse <- get_rmse(y = test_dt$acre_corn, yhat = rf_pred$predictions)
+rf_mae <- get_mae(y = test_dt$acre_corn, yhat = rf_pred$predictions)
+
+round(rf_rmse/1E6,2)
+round(rf_mae/1E6,2)
+```
+
+```{r}
+plot(test_dt$acre_corn, test_dt$acre_corn_lag1, pch = 19, col = "brown")
+abline(lm(acre_corn~acre_corn_lag1, data = test_dt), col = "tan")
+abline(0,1, col = "gray50")
+mtext(paste0("Naive RMSE with testing set: ",round(get_rmse(test_dt$acre_corn, test_dt$acre_corn_lag1)/1E6, 2)))
+```
